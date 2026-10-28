@@ -10,13 +10,19 @@ import sys
 import http.server
 
 class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
+    def send_response(self, code, message=None):
+        self._response_code = code
+        super().send_response(code, message)
+
     def end_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Connection", "close")
 
-        # Enable caching for static VFS archives to prevent duplicate HTTP Range requests
+        # Enable caching ONLY for successful VFS archive requests (200 OK / 206 Partial Content).
+        # Never cache 404s or failed lookups, so users don't get stuck on stale 404 disk cache.
+        is_success = getattr(self, '_response_code', 200) in (200, 206)
         path = self.translate_path(self.path)
-        if path.lower().endswith('.big'):
+        if is_success and path.lower().endswith('.big'):
             self.send_header("Cache-Control", "public, max-age=31536000, immutable")
         else:
             self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
@@ -89,7 +95,6 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
         return f
 
     def copyfile(self, source, outputfile):
-        # If we have a range content-length, copy only the requested bytes
         if hasattr(self, 'range_content_length') and self.range_content_length is not None:
             remaining = self.range_content_length
             buffer_size = 64 * 1024
@@ -97,15 +102,20 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
                 chunk = source.read(min(remaining, buffer_size))
                 if not chunk:
                     break
-                outputfile.write(chunk)
+                try:
+                    outputfile.write(chunk)
+                except (ConnectionResetError, ConnectionAbortedError):
+                    break
                 remaining -= len(chunk)
         else:
-            super().copyfile(source, outputfile)
+            try:
+                super().copyfile(source, outputfile)
+            except (ConnectionResetError, ConnectionAbortedError):
+                pass
 
 if __name__ == '__main__':
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8888
     server_address = ('', port)
-    # Enable SO_REUSEADDR
     http.server.ThreadingHTTPServer.allow_reuse_address = True
     httpd = http.server.ThreadingHTTPServer(server_address, RangeRequestHandler)
     print(f"Serving GeneralsX on port {port} with HTTP Range support...")
