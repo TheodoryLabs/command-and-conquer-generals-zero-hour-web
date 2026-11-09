@@ -472,7 +472,8 @@
         // Virtual UDP BroadcastChannel networking routing
         const urlParams = new URLSearchParams(window.location.search);
         const relayUrl = urlParams.get('relay');
-        const virtualNetEnabled = urlParams.has('virtual_net') || urlParams.has('ip') || urlParams.has('virtual_ip') || !!relayUrl;
+        const p2pEnabled = urlParams.has('p2p');
+        const virtualNetEnabled = urlParams.has('virtual_net') || urlParams.has('ip') || urlParams.has('virtual_ip') || !!relayUrl || p2pEnabled;
         
         let virtualIP = [127, 0, 0, 1];
         if (virtualNetEnabled) {
@@ -496,8 +497,9 @@
         // srcIP u32, destIP u32, srcPort u16, destPort u16 (big-endian), then the payload.
         // Default is BroadcastChannel (tabs on one machine). With ?relay=ws://host:8765&room=NAME
         // they go through scripts/lan_relay.py, so every player in the room shares one LAN.
-        // Adding &p2p sends them browser-to-browser over WebRTC data channels instead; the relay
-        // then only introduces peers and carries packets for any pair whose P2P link failed.
+        // ?p2p sends them browser-to-browser over WebRTC, no server needed (players swap invite
+        // codes). Adding &relay=...&room=... to ?p2p lets the relay introduce peers and stand in
+        // as a last-resort route.
         const encodePacket = (srcIP, destIP, srcPort, destPort, payload) => {
           const frame = new Uint8Array(12 + payload.length);
           const view = new DataView(frame.buffer);
@@ -522,92 +524,303 @@
           window.Module._free(ptr);
         };
 
-        // WebRTC mesh: one unordered, no-retransmit data channel (UDP-like) per peer in the room.
-        // Signaling is JSON text over the relay; ICE is not trickled, each side sends its SDP once
-        // gathering finishes. The smaller peer id always makes the offer, so offers never cross.
+        // WebRTC mesh, with or without a server. Each peer pair has two data channels: 'lan'
+        // (unordered, no retransmits: UDP-like) for game frames and 'ctl' (reliable) for control.
+        // Control messages {type, from, to} reach their target by the first route that works: a
+        // direct 'ctl', a neighbour whose links include the target, or the relay if there is one.
+        //  - Bootstrap without a server: invite/reply codes swapped by hand (any chat app).
+        //  - Discovery: peers gossip their direct links every 5 s; whoever learns of a peer it
+        //    isn't linked to connects through that neighbour, so one pairing joins the whole mesh.
+        //  - Offers: the smaller id always offers (manual invites excepted), so offers never cross.
+        //  - Resilience: frames for a peer without a direct link are forwarded by a neighbour that
+        //    has one; dead links are torn down and retried through the mesh; silent peers expire.
         const startPeerMesh = (ws) => {
           const myId = Math.random().toString(36).slice(2, 10);
-          const iceServers = [{ urls: urlParams.get('stun') || 'stun:stun.l.google.com:19302' }];
-          const peers = new Map(); // peer id -> { pc, dc }
-          const signal = (msg) => {
-            if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(Object.assign({ from: myId }, msg)));
+          const stun = urlParams.get('stun');
+          const iceServers = stun === 'none' ? [] : [{ urls: stun || 'stun:stun.l.google.com:19302' }];
+          const peers = new Map(); // id -> { pc, lan, ctl, links, heard, deadline, discAt, n }
+          const invites = new Map(); // nonce -> peer object, until its reply code is accepted
+          const isOpen = (ch) => !!ch && ch.readyState === 'open';
+          const nonce = () => Math.random().toString(36).slice(2, 10);
+          const warn = (err) => console.warn('[GeneralsX] P2P:', err);
+          const blank = () => ({ pc: null, lan: null, ctl: null, links: new Set(), heard: Date.now(), deadline: 0, discAt: 0, n: null });
+          const getPeer = (id) => { if (!peers.has(id)) peers.set(id, blank()); return peers.get(id); };
+          const direct = () => [...peers].filter(([, p]) => isOpen(p.ctl)).map(([id]) => id);
+
+          const route = (msg) => {
+            const json = JSON.stringify(msg);
+            const p = peers.get(msg.to);
+            if (p && isOpen(p.ctl)) return p.ctl.send(json);
+            for (const n of peers.values()) {
+              if (isOpen(n.ctl) && n.links.has(msg.to)) return n.ctl.send(json);
+            }
+            if (ws && ws.readyState === WebSocket.OPEN) ws.send(json);
+            // otherwise unreachable for now: dropped, like UDP; the next tick retries the link
           };
-          const watchChannel = (peer, dc) => {
-            peer.dc = dc;
-            dc.binaryType = 'arraybuffer';
-            dc.onopen = () => console.log('[GeneralsX] P2P link open');
-            dc.onmessage = (e) => deliverPacket(new Uint8Array(e.data));
+          const signal = (msg) => route(Object.assign({ from: myId, ttl: 3 }, msg));
+          const sendLinks = () => {
+            const msg = JSON.stringify({ type: 'links', from: myId, ids: direct() });
+            peers.forEach((p) => { if (isOpen(p.ctl)) p.ctl.send(msg); });
           };
-          const newPeer = (id) => {
-            if (peers.has(id)) peers.get(id).pc.close();
-            const peer = { pc: new RTCPeerConnection({ iceServers: iceServers }), dc: null };
-            peer.pc.ondatachannel = (e) => watchChannel(peer, e.channel);
-            peers.set(id, peer);
-            return peer;
+
+          const drop = (p) => {
+            if (p.pc) p.pc.close();
+            p.pc = p.lan = p.ctl = null;
+            updateStatus();
           };
+          const attach = (p, pc, ch) => {
+            if (p.pc !== pc) return; // channel from a connection we already replaced
+            ch.binaryType = 'arraybuffer';
+            if (ch.label === 'lan') {
+              p.lan = ch;
+              ch.onmessage = (e) => { p.heard = Date.now(); deliverPacket(new Uint8Array(e.data)); };
+              return;
+            }
+            p.ctl = ch;
+            const opened = () => { console.log('[GeneralsX] P2P link open'); updateStatus(); sendLinks(); };
+            ch.onopen = opened;
+            ch.onclose = updateStatus;
+            ch.onmessage = (e) => { p.heard = Date.now(); onControl(e.data); };
+            if (ch.readyState === 'open') opened();
+          };
+          const openPc = (p, offerer) => {
+            drop(p);
+            const pc = new RTCPeerConnection({ iceServers: iceServers });
+            p.pc = pc;
+            p.deadline = Date.now() + 20000; // a handshake that hasn't opened by then is retried
+            p.discAt = 0;
+            pc.ondatachannel = (e) => attach(p, pc, e.channel);
+            pc.onconnectionstatechange = () => {
+              if (p.pc !== pc) return;
+              if (pc.connectionState === 'disconnected') p.discAt = Date.now();
+              else if (pc.connectionState === 'connected') p.discAt = 0;
+              else if (pc.connectionState === 'failed') drop(p);
+            };
+            if (offerer) {
+              attach(p, pc, pc.createDataChannel('lan', { ordered: false, maxRetransmits: 0 }));
+              attach(p, pc, pc.createDataChannel('ctl'));
+            }
+            return pc;
+          };
+          // Gathering can stall (STUN blocked); after 5 s use whatever candidates exist.
           const gathered = (pc) => new Promise((resolve) => {
             if (pc.iceGatheringState === 'complete') return resolve();
+            setTimeout(resolve, 5000);
             pc.addEventListener('icegatheringstatechange', () => {
               if (pc.iceGatheringState === 'complete') resolve();
             });
           });
-          const describe = async (peer, to, type) => {
-            await peer.pc.setLocalDescription(type === 'offer' ? await peer.pc.createOffer() : await peer.pc.createAnswer());
-            await gathered(peer.pc);
-            signal({ type: type, to: to, sdp: peer.pc.localDescription.sdp });
+          const makeOffer = async (p) => {
+            const pc = openPc(p, true);
+            p.n = nonce();
+            await pc.setLocalDescription(await pc.createOffer());
+            await gathered(pc);
+            return pc;
           };
-
-          ws.onopen = () => signal({ type: 'hello' });
-          ws.onmessage = async (e) => {
-            if (typeof e.data !== 'string') return;
-            const msg = JSON.parse(e.data);
-            if (msg.to !== undefined && ![].concat(msg.to).includes(myId)) return;
-            if (msg.type === 'hello') {
-              if (myId > msg.from) return signal({ type: 'hello', to: msg.from }); // they offer
-              if (peers.has(msg.from)) return;
-              const peer = newPeer(msg.from);
-              watchChannel(peer, peer.pc.createDataChannel('lan', { ordered: false, maxRetransmits: 0 }));
-              await describe(peer, msg.from, 'offer');
-            } else if (msg.type === 'offer') {
-              const peer = newPeer(msg.from);
-              await peer.pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
-              await describe(peer, msg.from, 'answer');
-            } else if (msg.type === 'answer' && peers.has(msg.from)) {
-              await peers.get(msg.from).pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
-            } else if (msg.type === 'pkt') {
-              deliverPacket(Uint8Array.from(atob(msg.data), (c) => c.charCodeAt(0)));
+          const makeAnswer = async (p, sdp) => {
+            const pc = openPc(p, false);
+            await pc.setRemoteDescription({ type: 'offer', sdp: sdp });
+            await pc.setLocalDescription(await pc.createAnswer());
+            await gathered(pc);
+            return pc;
+          };
+          const takeAnswer = async (p, n, sdp) => {
+            if (p.pc && p.n === n && p.pc.signalingState === 'have-local-offer') {
+              p.deadline = Date.now() + 20000; // invites wait for a human; the clock starts now
+              await p.pc.setRemoteDescription({ type: 'answer', sdp: sdp });
             }
           };
 
-          // Every peer gets every frame (the receiver filters by IP, as on a real LAN).
-          // ponytail: peers that left stay in the map and keep getting relay fallback; prune on a 'bye' if it matters.
-          return (frame) => {
-            const viaRelay = [];
-            peers.forEach((peer, id) => {
-              if (peer.dc && peer.dc.readyState === 'open') {
-                try { peer.dc.send(frame); } catch (err) { /* buffer full: dropped, like UDP */ }
+          const connect = async (id) => {
+            const p = getPeer(id);
+            const pc = await makeOffer(p);
+            if (p.pc === pc) signal({ type: 'offer', to: id, n: p.n, sdp: pc.localDescription.sdp });
+          };
+          // Heard of a peer we have no connection to: the smaller id offers, the larger says hello.
+          const learn = (id, sayHello) => {
+            if (!id || id === myId) return;
+            const p = getPeer(id);
+            if (p.pc) return;
+            if (myId < id) connect(id).catch(warn);
+            else if (sayHello) signal({ type: 'hello', to: id });
+          };
+
+          const onControl = async (raw) => {
+            let msg;
+            try { msg = JSON.parse(raw); } catch (err) { return; }
+            if (msg.to !== undefined && msg.to !== myId) { // not ours: pass it one hop on
+              if (--msg.ttl > 0) route(msg);
+              return;
+            }
+            if (!msg.from || msg.from === myId) return;
+            const p = getPeer(msg.from);
+            p.heard = Date.now();
+            try {
+              if (msg.type === 'hello') {
+                learn(msg.from, msg.to === undefined); // answer a broadcast hello so they know us
+              } else if (msg.type === 'links') {
+                p.links = new Set(msg.ids);
+                msg.ids.forEach((id) => learn(id, true));
+              } else if (msg.type === 'offer') {
+                const pc = await makeAnswer(p, msg.sdp);
+                if (p.pc === pc) signal({ type: 'answer', to: msg.from, n: msg.n, sdp: pc.localDescription.sdp });
+              } else if (msg.type === 'answer') {
+                await takeAnswer(p, msg.n, msg.sdp);
+              } else if (msg.type === 'pkt') {
+                deliverPacket(Uint8Array.from(atob(msg.data), (c) => c.charCodeAt(0)));
+              }
+            } catch (err) {
+              warn(err);
+            }
+          };
+
+          setInterval(() => {
+            const now = Date.now();
+            peers.forEach((p, id) => {
+              if (p.pc) {
+                const stuck = !isOpen(p.ctl) && now > p.deadline;
+                const lost = p.discAt && now - p.discAt > 10000;
+                if (stuck || lost) drop(p);
+              } else if (now - p.heard > 60000) {
+                peers.delete(id); // gone: nothing heard from them for a minute
               } else {
-                viaRelay.push(id);
+                learn(id, true); // still around but not linked: try again
               }
             });
-            if (viaRelay.length) signal({ type: 'pkt', to: viaRelay, data: btoa(String.fromCharCode.apply(null, frame)) });
+            sendLinks();
+            updateStatus();
+          }, 5000);
+
+          if (ws) {
+            ws.onopen = () => ws.send(JSON.stringify({ type: 'hello', from: myId }));
+            ws.onmessage = (e) => {
+              if (typeof e.data !== 'string') return;
+              const to = (e.data.match(/"to":"([^"]*)"/) || [])[1];
+              if (to === undefined || to === myId) onControl(e.data); // relay broadcasts to all
+            };
+          }
+
+          // Invite codes: deflated JSON, base64url. They hold an SDP, so they're ~1-2 KB.
+          const pack = async (obj) => {
+            const stream = new Blob([JSON.stringify(obj)]).stream().pipeThrough(new CompressionStream('deflate-raw'));
+            const bytes = new Uint8Array(await new Response(stream).arrayBuffer());
+            return 'GX1.' + btoa(String.fromCharCode.apply(null, bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+          };
+          const unpack = async (code) => {
+            const b64 = code.trim().replace(/^GX1\./, '').replace(/-/g, '+').replace(/_/g, '/');
+            const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+            const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+            return JSON.parse(await new Response(stream).text());
+          };
+
+          p2pApi = {
+            id: myId,
+            // Host: make a code for one joining player.
+            invite: async () => {
+              const p = blank();
+              const pc = await makeOffer(p);
+              invites.set(p.n, p);
+              return pack({ kind: 'offer', from: myId, n: p.n, sdp: pc.localDescription.sdp });
+            },
+            // Joiner: paste the host's code, get a reply code to send back.
+            join: async (code) => {
+              const o = await unpack(code);
+              if (o.kind !== 'offer' || o.from === myId) throw new Error('not an invite code');
+              const p = getPeer(o.from);
+              p.heard = Date.now();
+              const pc = await makeAnswer(p, o.sdp);
+              p.deadline = Date.now() + 600000; // the host has 10 minutes to paste the reply
+              return pack({ kind: 'answer', from: myId, n: o.n, sdp: pc.localDescription.sdp });
+            },
+            // Host: paste the joiner's reply code.
+            accept: async (code) => {
+              const a = await unpack(code);
+              const p = a.kind === 'answer' && invites.get(a.n);
+              if (!p) throw new Error('not a reply to an invite from this tab');
+              invites.delete(a.n);
+              const old = peers.get(a.from);
+              if (old && old !== p) drop(old);
+              p.heard = Date.now();
+              peers.set(a.from, p);
+              await takeAnswer(p, a.n, a.sdp);
+            },
+            peers: () => [...peers].map(([id, p]) => ({ id: id, direct: isOpen(p.ctl), state: p.pc ? p.pc.connectionState : 'none' })),
+            // Drop the direct link to one peer (it reconnects through the mesh on the next tick).
+            disconnect: (id) => { if (peers.has(id)) drop(peers.get(id)); },
+          };
+
+          // Every peer gets every frame (the receiver filters by IP, as on a real LAN).
+          return (frame) => {
+            let b64 = null;
+            peers.forEach((p, id) => {
+              if (isOpen(p.lan)) {
+                try { p.lan.send(frame); } catch (err) { /* buffer full: dropped, like UDP */ }
+              } else {
+                b64 = b64 || btoa(String.fromCharCode.apply(null, frame));
+                signal({ type: 'pkt', to: id, data: b64 }); // via a neighbour or the relay
+              }
+            });
           };
         };
 
+        // Small panel for invite/reply codes. ponytail: prompt() pauses the game while open; fine in the lobby.
+        let p2pApi = null;
+        const statusEl = document.createElement('div');
+        const updateStatus = () => {
+          if (!p2pApi) return;
+          const list = p2pApi.peers();
+          statusEl.textContent = `P2P: ${list.filter((p) => p.direct).length} direct / ${list.length} players`;
+        };
+        const showP2pPanel = () => {
+          const panel = document.createElement('div');
+          panel.id = 'gx-p2p';
+          panel.style.cssText = 'position:fixed;top:8px;right:8px;z-index:1000;display:flex;gap:6px;align-items:center;' +
+            'font:12px system-ui,sans-serif;color:#fff;background:rgba(0,0,0,.65);padding:6px 8px;border-radius:6px';
+          const button = (label, action) => {
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.textContent = label;
+            b.onclick = () => action().catch((err) => alert('P2P: ' + err.message));
+            panel.appendChild(b);
+          };
+          const copy = (code) => navigator.clipboard && navigator.clipboard.writeText(code).catch(() => {});
+          button('Invite', async () => {
+            const code = await p2pApi.invite();
+            copy(code);
+            prompt('Invite code (copied). Send it to the player joining, then press "Accept reply" with their answer.', code);
+          });
+          button('Join', async () => {
+            const code = prompt('Paste the invite code:');
+            if (!code) return;
+            const reply = await p2pApi.join(code);
+            copy(reply);
+            prompt('Reply code (copied). Send it back to the player who invited you.', reply);
+          });
+          button('Accept reply', async () => {
+            const code = prompt('Paste the reply code:');
+            if (code) await p2pApi.accept(code);
+          });
+          panel.appendChild(statusEl);
+          document.body.appendChild(panel);
+          updateStatus();
+        };
+
         let sendFrame;
+        let ws = null;
         if (relayUrl) {
           const room = encodeURIComponent(urlParams.get('room') || 'lobby');
-          const ws = new WebSocket(relayUrl.replace(/\/+$/, '') + '/' + room);
+          ws = new WebSocket(relayUrl.replace(/\/+$/, '') + '/' + room);
           ws.binaryType = 'arraybuffer';
           ws.addEventListener('open', () => console.log(`[GeneralsX] LAN relay connected: ${relayUrl} room ${room}`));
-          ws.onclose = () => console.warn('[GeneralsX] LAN relay disconnected; reload to rejoin');
-          if (urlParams.has('p2p')) {
-            sendFrame = startPeerMesh(ws);
-          } else {
-            ws.onmessage = (e) => { if (typeof e.data !== 'string') deliverPacket(new Uint8Array(e.data)); };
-            // ponytail: packets sent before the socket opens are dropped (UDP semantics); no auto-reconnect.
-            sendFrame = (frame) => { if (ws.readyState === WebSocket.OPEN) ws.send(frame); };
-          }
+          ws.addEventListener('close', () => console.warn('[GeneralsX] LAN relay disconnected; reload to rejoin'));
+        }
+        if (p2pEnabled) {
+          sendFrame = startPeerMesh(ws);
+          if (document.body) showP2pPanel(); else document.addEventListener('DOMContentLoaded', showP2pPanel);
+        } else if (ws) {
+          ws.onmessage = (e) => { if (typeof e.data !== 'string') deliverPacket(new Uint8Array(e.data)); };
+          // ponytail: packets sent before the socket opens are dropped (UDP semantics); no auto-reconnect.
+          sendFrame = (frame) => { if (ws.readyState === WebSocket.OPEN) ws.send(frame); };
         } else {
           const bc = new BroadcastChannel('generalsx-virtual-lan');
           bc.onmessage = (e) => { if (e.data instanceof Uint8Array) deliverPacket(e.data); };

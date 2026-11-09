@@ -9,11 +9,12 @@ sends is forwarded to everyone else in the same room. The relay never parses fra
 page drops packets not addressed to its own virtual IP. Binary frames are game packets;
 text frames are WebRTC signaling (and fallback packets) for pages opened with &p2p.
 
-    pip install websockets
+    pip install "websockets>=10.1"
     python3 scripts/lan_relay.py [--host 0.0.0.0] [--port 8765]
 
 Players then open GeneralsZH.html?relay=ws://HOST:8765&room=NAME      (all traffic via relay)
-               or GeneralsZH.html?relay=ws://HOST:8765&room=NAME&p2p  (browser-to-browser WebRTC)
+               or GeneralsZH.html?p2p&relay=ws://HOST:8765&room=NAME  (WebRTC, relay as fallback)
+The relay is optional for WebRTC: GeneralsZH.html?p2p works with no server (invite codes).
 """
 
 import argparse

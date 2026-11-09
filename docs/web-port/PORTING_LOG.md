@@ -1360,12 +1360,28 @@ binaries from backups, then made the from-source build reproducible for the firs
 - Added `scripts/lan_relay.py`, a room-based WebSocket relay: frames go to everyone else in
   the room, unparsed. `?relay=ws://host:8765&room=NAME` switches the page from
   `BroadcastChannel` to it. Same binary frame on both transports.
-- Added `&p2p`: a WebRTC mesh, one unordered no-retransmit data channel per peer (UDP-like).
-  The relay doubles as signaling (JSON text frames; binary frames stay game packets). ICE is
-  not trickled; the smaller peer id always offers, so offers never cross. A pair whose P2P link
-  never opens keeps talking through the relay as base64 `pkt` messages, so a strict NAT costs
-  latency, not the match. No TURN server needed for that reason.
-- **Not yet verified in a real LAN skirmish.** Verified: `scripts/test_lan_relay.py`; the
-  shell's network block in Node across two fake pages over the live relay; and in Chrome,
-  two tabs forming a real WebRTC link (0 packets via relay), plus a forced-relay-only peer
-  falling back to the relay in both directions.
+- Added `?p2p`, a WebRTC mesh that needs no server. Each pair has a `lan` channel (unordered,
+  no retransmits: UDP-like) for game frames and a reliable `ctl` channel for control. Control
+  messages reach their target over a direct `ctl`, through a neighbour whose links include the
+  target (ttl 3), or through the relay if there is one.
+  - Bootstrap: invite/reply codes (deflated JSON with the SDP, ~800 chars) swapped by hand.
+  - Discovery: peers gossip their direct links every 5 s; a peer that learns of someone it
+    isn't linked to connects through that neighbour, so one pairing joins the whole group.
+  - Offers: the smaller id offers (manual invites excepted); offers carry a nonce, so a stale
+    answer can't land on a newer connection.
+  - Resilience: a peer without a direct link still gets every frame, forwarded by a neighbour;
+    failed or stuck links are dropped and retried; peers silent for 60 s are forgotten.
+  - ICE is not trickled; gathering gives up after 5 s and sends what it has.
+  - `?p2p&relay=...` adds automatic discovery and the relay as the last-resort route.
+- Review catch: the larger-id peer only replied to a hello and didn't record the newcomer, so
+  until the offer arrived (never, if STUN was blocked) it sent that peer nothing. Every peer
+  is now recorded on first contact and covered by the fallback routes from the start.
+- Own catch while testing: the 20 s "stuck handshake" timer started when an invite was made,
+  so a human-speed code swap was torn down on accept. It now starts once both sides have each
+  other's description; a joiner waits up to 10 minutes for the host.
+- **Not yet verified in a real LAN skirmish.** Verified in Chrome with the shell's network
+  block (game side stubbed): three tabs, no server, A paired with B and C paired with B, A–C
+  linked on its own; broadcasts and unicasts correct; with A–C cut and blocked, frames went
+  through B both ways; unblocked, A–C relinked in 18 s; B closed, A–C kept going and B was
+  forgotten. With a relay: automatic discovery, and a blocked peer played through the relay.
+  Relay-only and `BroadcastChannel` modes re-checked in Node; `scripts/test_lan_relay.py`.

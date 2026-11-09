@@ -114,28 +114,56 @@ The game will:
 
 ## Multiplayer (virtual LAN, experimental)
 
-The browser has no raw UDP, so the game's LAN traffic travels over a virtual LAN.
+The browser has no raw UDP, so the game's LAN traffic travels over a virtual LAN. Once players
+are connected they see each other under **Network → LAN**.
 
-- **Two tabs on one machine**: open both with `?virtual_net`. They talk over a `BroadcastChannel`.
-- **Different machines**: run the relay on a host every player can reach (a small cloud VM is fine):
+| Link ends with | How players connect | Server |
+|---|---|---|
+| `?p2p` | Browser-to-browser over WebRTC; players swap invite codes | none |
+| `?p2p&relay=ws://<host>:8765&room=friday` | WebRTC, found automatically; the relay is the last-resort route | relay |
+| `?relay=ws://<host>:8765&room=friday` | All traffic through the relay | relay |
+| `?virtual_net` | Tabs on one machine (`BroadcastChannel`) | none |
 
-  ```bash
-  pip install websockets
-  python3 scripts/lan_relay.py --port 8765
-  ```
+Everyone in a game must use the same row.
 
-  Every player then opens one of:
+### Playing with no server (`?p2p`)
 
-  | Link ends with | Game traffic goes |
-  |---|---|
-  | `?relay=ws://<relay-host>:8765&room=friday` | through the relay |
-  | `?relay=ws://<relay-host>:8765&room=friday&p2p` | browser-to-browser over WebRTC; the relay only introduces players, and carries traffic for any pair that can't connect directly |
+A **P2P** panel appears in the top-right corner.
 
-  Everyone in a room must use the same mode. Everyone in the same `room` is on the same LAN
-  and sees each other under **Network → LAN**. WebRTC uses Google's public STUN server;
-  pass `&stun=stun:host:port` to use another.
-  Each player gets a random `10.0.0.x` address; pass `&ip=10.0.0.N` to pick one and avoid clashes.
-  A page served over `https` needs a `wss://` relay (put it behind a TLS proxy).
+1. Any player in the game presses **Invite** and sends the code (copied for you) to the
+   player joining, by any chat app.
+2. The joining player presses **Join**, pastes the code, and sends back the reply code.
+3. The inviting player presses **Accept reply** and pastes it.
+
+The new player only has to pair with **one** member: that member introduces them to everyone
+else over WebRTC, and the whole group links up within a few seconds. The panel shows
+`P2P: direct / players`.
+
+- **If a link between two players drops**, their traffic is forwarded through a player who
+  can still reach both, and the direct link is retried automatically.
+- **If a player leaves**, the rest keep playing; the leaver is forgotten after a minute.
+- **If the only link of a two-player game drops for good**, swap codes again.
+
+WebRTC asks Google's public STUN server for each player's public address; that is not a
+server you run. Players on the same local network can pass `&stun=none`; `&stun=stun:host:port`
+picks another. A few strict networks (some mobile carriers, corporate firewalls) block direct
+WebRTC entirely: those players can still play if at least one other player reaches them, or
+add a relay.
+
+### Running a relay (optional)
+
+On any host the players can reach (a small cloud VM is fine):
+
+```bash
+pip install "websockets>=10.1"
+python3 scripts/lan_relay.py --port 8765
+```
+
+With `?p2p&relay=...` players in the same `room` find each other with no codes, and a player
+nobody can reach directly still plays through the relay. A page served over `https` needs a
+`wss://` relay (put it behind a TLS proxy).
+
+Each player gets a random `10.0.0.x` address; pass `&ip=10.0.0.N` to pick one and avoid clashes.
 
 ---
 
