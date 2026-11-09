@@ -1348,3 +1348,19 @@ binaries from backups, then made the from-source build reproducible for the firs
   `WWAudio/Threads.cpp` compiled directly into the web target (WWAudio has no CMake target yet).
 - **Verified**: clean `emcmake cmake -G Ninja` + `ninja z_generals` build boots to the animated
   main menu in a headless browser. CI now runs this exact build on every push.
+
+## 2026-11-09 — Session 15: WebSocket relay for the virtual LAN
+- Set out to carry the virtual-UDP seam between machines, not just tabs.
+- Found the seam had one packet queue shared by every UDP socket, so the lobby socket (8086)
+  and the game socket (8088) could read each other's packets. `udp.cpp` now tags packets with
+  their destination port and each socket reads only its own; the queue is capped at 1024.
+- The JS side hard-coded `srcPort: 8087` and compared the broadcast address against
+  `0xFFFFFFFF` while `EM_ASM` hands it over as signed `-1`. The sender's real port now flows
+  through `onSendPacket`, and addresses are coerced to unsigned.
+- Added `scripts/lan_relay.py`, a room-based WebSocket relay: frames go to everyone else in
+  the room, unparsed. `?relay=ws://host:8765&room=NAME` switches the page from
+  `BroadcastChannel` to it. Same binary frame on both transports.
+- A relay, not WebRTC: it works behind every NAT with no STUN/TURN, and the game's lockstep
+  traffic is small. Peer-to-peer data channels can come later behind the same `sendFrame`.
+- **Not yet verified in a real LAN skirmish.** Verified: `scripts/test_lan_relay.py`, and the
+  shell's network block run in Node across two fake pages over the live relay.

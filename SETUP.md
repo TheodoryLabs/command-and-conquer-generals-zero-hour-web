@@ -112,6 +112,26 @@ The game will:
 
 ---
 
+## Multiplayer (virtual LAN, experimental)
+
+The browser has no raw UDP, so the game's LAN traffic travels over a virtual LAN.
+
+- **Two tabs on one machine**: open both with `?virtual_net`. They talk over a `BroadcastChannel`.
+- **Different machines**: run the relay on a host every player can reach (a small cloud VM is fine):
+
+  ```bash
+  pip install websockets
+  python3 scripts/lan_relay.py --port 8765
+  ```
+
+  Every player then opens
+  `http://<game-host>:8888/GeneralsZH.html?relay=ws://<relay-host>:8765&room=friday`.
+  Everyone in the same `room` is on the same LAN and sees each other under **Network → LAN**.
+  Each player gets a random `10.0.0.x` address; pass `&ip=10.0.0.N` to pick one and avoid clashes.
+  A page served over `https` needs a `wss://` relay (put it behind a TLS proxy).
+
+---
+
 ## Troubleshooting
 
 ### Black screen / nothing loads

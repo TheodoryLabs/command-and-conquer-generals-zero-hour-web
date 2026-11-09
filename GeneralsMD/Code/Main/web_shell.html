@@ -471,7 +471,8 @@
 
         // Virtual UDP BroadcastChannel networking routing
         const urlParams = new URLSearchParams(window.location.search);
-        const virtualNetEnabled = urlParams.has('virtual_net') || urlParams.has('ip') || urlParams.has('virtual_ip');
+        const relayUrl = urlParams.get('relay');
+        const virtualNetEnabled = urlParams.has('virtual_net') || urlParams.has('ip') || urlParams.has('virtual_ip') || !!relayUrl;
         
         let virtualIP = [127, 0, 0, 1];
         if (virtualNetEnabled) {
@@ -491,25 +492,49 @@
         };
         const virtualIPInt = ipToUint32(virtualIP);
 
-        const bc = new BroadcastChannel('generalsx-virtual-lan');
-        bc.onmessage = function (e) {
-          if (!virtualNetEnabled) return;
-          if (e.data && e.data.type === 'udp_packet') {
-            const packet = e.data;
-            const isBroadcast = packet.destIP === 0xFFFFFFFF;
-            const isForUs = isBroadcast || (packet.destIP === virtualIPInt);
-            if (isForUs && packet.srcIP !== virtualIPInt) {
-              if (window.Module && typeof window.Module._GX_Network_PushPacket === 'function') {
-                const payload = packet.payload;
-                const len = payload.length;
-                const ptr = window.Module._malloc(len);
-                window.Module.HEAPU8.set(payload, ptr);
-                window.Module._GX_Network_PushPacket(ptr, len, packet.srcIP, packet.srcPort);
-                window.Module._free(ptr);
-              }
-            }
-          }
+        // GeneralsX @feature 09/11/2026 Virtual LAN transport. Packets travel as one binary frame:
+        // srcIP u32, destIP u32, srcPort u16, destPort u16 (big-endian), then the payload.
+        // Default is BroadcastChannel (tabs on one machine). With ?relay=ws://host:8765&room=NAME
+        // they go through scripts/lan_relay.py, so every player in the room shares one LAN.
+        const encodePacket = (srcIP, destIP, srcPort, destPort, payload) => {
+          const frame = new Uint8Array(12 + payload.length);
+          const view = new DataView(frame.buffer);
+          view.setUint32(0, srcIP); view.setUint32(4, destIP);
+          view.setUint16(8, srcPort); view.setUint16(10, destPort);
+          frame.set(payload, 12);
+          return frame;
         };
+
+        const deliverPacket = (frame) => {
+          if (!virtualNetEnabled || frame.length < 12) return;
+          const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
+          const srcIP = view.getUint32(0), destIP = view.getUint32(4);
+          const srcPort = view.getUint16(8), destPort = view.getUint16(10);
+          const isForUs = destIP === 0xFFFFFFFF || destIP === virtualIPInt;
+          if (!isForUs || srcIP === virtualIPInt) return;
+          if (!window.Module || typeof window.Module._GX_Network_PushPacket !== 'function') return;
+          const payload = frame.subarray(12);
+          const ptr = window.Module._malloc(payload.length);
+          window.Module.HEAPU8.set(payload, ptr);
+          window.Module._GX_Network_PushPacket(ptr, payload.length, srcIP, srcPort, destPort);
+          window.Module._free(ptr);
+        };
+
+        let sendFrame;
+        if (relayUrl) {
+          const room = encodeURIComponent(urlParams.get('room') || 'lobby');
+          const ws = new WebSocket(relayUrl.replace(/\/+$/, '') + '/' + room);
+          ws.binaryType = 'arraybuffer';
+          ws.onopen = () => console.log(`[GeneralsX] LAN relay connected: ${relayUrl} room ${room}`);
+          ws.onclose = () => console.warn('[GeneralsX] LAN relay disconnected; reload to rejoin');
+          ws.onmessage = (e) => deliverPacket(new Uint8Array(e.data));
+          // ponytail: packets sent before the socket opens are dropped (UDP semantics); no auto-reconnect.
+          sendFrame = (frame) => { if (ws.readyState === WebSocket.OPEN) ws.send(frame); };
+        } else {
+          const bc = new BroadcastChannel('generalsx-virtual-lan');
+          bc.onmessage = (e) => { if (e.data instanceof Uint8Array) deliverPacket(e.data); };
+          sendFrame = (frame) => bc.postMessage(frame);
+        }
 
         // Stage display names. The C++ side uses the keys; the UI uses the values.
         const STAGE_LABELS = {
@@ -637,16 +662,9 @@
         window.GeneralsX = {
           virtualIP: virtualIP,
           virtualNetEnabled: virtualNetEnabled,
-          onSendPacket: function (data, destIP, destPort) {
+          onSendPacket: function (data, destIP, destPort, srcPort) {
             if (!virtualNetEnabled) return;
-            bc.postMessage({
-              type: 'udp_packet',
-              srcIP: virtualIPInt,
-              srcPort: 8087,
-              destIP: destIP,
-              destPort: destPort,
-              payload: data
-            });
+            sendFrame(encodePacket(virtualIPInt, destIP >>> 0, srcPort, destPort, data));
           },
 
           setProgress: function (stage, current, total, label) {
