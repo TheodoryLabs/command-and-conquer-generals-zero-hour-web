@@ -117,53 +117,43 @@ The game will:
 The browser has no raw UDP, so the game's LAN traffic travels over a virtual LAN. Once players
 are connected they see each other under **Network → LAN**.
 
-| Link ends with | How players connect | Server |
-|---|---|---|
-| `?p2p` | Browser-to-browser over WebRTC; players swap invite codes | none |
-| `?p2p&relay=ws://<host>:8765&room=friday` | WebRTC, found automatically; the relay is the last-resort route | relay |
-| `?relay=ws://<host>:8765&room=friday` | All traffic through the relay | relay |
-| `?virtual_net` | Tabs on one machine (`BroadcastChannel`) | none |
+| Link ends with | How players connect |
+|---|---|
+| `?p2p` | Browser-to-browser over WebRTC, between any machines; players swap invite codes. No server. |
+| `?virtual_net` | Tabs on one machine (`BroadcastChannel`) |
 
 Everyone in a game must use the same row.
 
-### Playing with no server (`?p2p`)
+### Playing over WebRTC (`?p2p`)
 
-A **P2P** panel appears in the top-right corner.
+A **P2P** panel appears in the top-right corner. Pair in the lobby: the code boxes pause the
+game while they're open.
 
-1. Any player in the game presses **Invite** and sends the code (copied for you) to the
-   player joining, by any chat app.
+1. Any player in the game presses **Invite** and sends the code to the player joining, by
+   any chat app.
 2. The joining player presses **Join**, pastes the code, and sends back the reply code.
-3. The inviting player presses **Accept reply** and pastes it.
+3. The inviting player presses **Accept reply** and pastes it. There's no rush: a code stays
+   good for 10 minutes.
 
 The new player only has to pair with **one** member: that member introduces them to everyone
-else over WebRTC, and the whole group links up within a few seconds. The panel shows
+else over WebRTC, and the whole group links up within about 10–20 seconds. The panel shows
 `P2P: direct / players`.
 
-- **If a link between two players drops**, their traffic is forwarded through a player who
-  can still reach both, and the direct link is retried automatically.
+- **Short network blips** are left to WebRTC, which recovers the link by itself.
+- **If the browser gives a link up** (WebRTC reports it failed), the two players' traffic is
+  forwarded through a player who can still reach both, and the direct link is retried
+  through the others.
 - **If a player leaves**, the rest keep playing; the leaver is forgotten after a minute.
-- **If the only link of a two-player game drops for good**, swap codes again.
+- **A two-player game has nobody to forward through**: if its only link fails, swap codes again.
 
 WebRTC asks Google's public STUN server for each player's public address; that is not a
-server you run. Players on the same local network can pass `&stun=none`; `&stun=stun:host:port`
-picks another. A few strict networks (some mobile carriers, corporate firewalls) block direct
-WebRTC entirely: those players can still play if at least one other player reaches them, or
-add a relay.
+server you run. Players on the same local network can pass `&stun=none`, though some routers
+block the local discovery that then relies on; `&stun=stun:host:port` picks another server.
+A few strict networks (some mobile carriers, corporate firewalls) block direct WebRTC: such a
+player can still play as long as at least one other player can reach them.
 
-### Running a relay (optional)
-
-On any host the players can reach (a small cloud VM is fine):
-
-```bash
-pip install "websockets>=10.1"
-python3 scripts/lan_relay.py --port 8765
-```
-
-With `?p2p&relay=...` players in the same `room` find each other with no codes, and a player
-nobody can reach directly still plays through the relay. A page served over `https` needs a
-`wss://` relay (put it behind a TLS proxy).
-
-Each player gets a random `10.0.0.x` address; pass `&ip=10.0.0.N` to pick one and avoid clashes.
+Each player gets a random `10.0.0.x` address; if the console warns of a clash, reload with
+`&ip=10.0.0.N`.
 
 ---
 

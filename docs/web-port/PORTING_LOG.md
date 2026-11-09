@@ -1349,39 +1349,50 @@ binaries from backups, then made the from-source build reproducible for the firs
 - **Verified**: clean `emcmake cmake -G Ninja` + `ninja z_generals` build boots to the animated
   main menu in a headless browser. CI now runs this exact build on every push.
 
-## 2026-11-09 — Session 15: WebSocket relay for the virtual LAN
-- Set out to carry the virtual-UDP seam between machines, not just tabs.
+## 2026-11-09 — Session 15: Serverless WebRTC multiplayer on the virtual LAN
+- Set out to carry the virtual-UDP seam between machines, not just tabs, with no server.
 - Found the seam had one packet queue shared by every UDP socket, so the lobby socket (8086)
   and the game socket (8088) could read each other's packets. `udp.cpp` now tags packets with
   their destination port and each socket reads only its own; the queue is capped at 1024.
 - The JS side hard-coded `srcPort: 8087` and compared the broadcast address against
   `0xFFFFFFFF` while `EM_ASM` hands it over as signed `-1`. The sender's real port now flows
-  through `onSendPacket`, and addresses are coerced to unsigned.
-- Added `scripts/lan_relay.py`, a room-based WebSocket relay: frames go to everyone else in
-  the room, unparsed. `?relay=ws://host:8765&room=NAME` switches the page from
-  `BroadcastChannel` to it. Same binary frame on both transports.
-- Added `?p2p`, a WebRTC mesh that needs no server. Each pair has a `lan` channel (unordered,
-  no retransmits: UDP-like) for game frames and a reliable `ctl` channel for control. Control
-  messages reach their target over a direct `ctl`, through a neighbour whose links include the
-  target (ttl 3), or through the relay if there is one.
-  - Bootstrap: invite/reply codes (deflated JSON with the SDP, ~800 chars) swapped by hand.
+  through `onSendPacket`, and addresses are coerced to unsigned. Packets travel as one binary
+  frame (src/dest IP and port, then payload) on both transports.
+- Added `?p2p`, a WebRTC mesh. Each pair has a `lan` channel (unordered, no retransmits:
+  UDP-like) for game frames and a reliable `ctl` channel for control. Control messages reach
+  their target over a direct `ctl` or through a neighbour linked to it (ttl 3).
+  - Bootstrap: invite/reply codes (deflated JSON holding the SDP, about 1 KB) swapped by hand.
   - Discovery: peers gossip their direct links every 5 s; a peer that learns of someone it
     isn't linked to connects through that neighbour, so one pairing joins the whole group.
   - Offers: the smaller id offers (manual invites excepted); offers carry a nonce, so a stale
-    answer can't land on a newer connection.
-  - Resilience: a peer without a direct link still gets every frame, forwarded by a neighbour;
-    failed or stuck links are dropped and retried; peers silent for 60 s are forgotten.
-  - ICE is not trickled; gathering gives up after 5 s and sends what it has.
-  - `?p2p&relay=...` adds automatic discovery and the relay as the last-resort route.
-- Review catch: the larger-id peer only replied to a hello and didn't record the newcomer, so
-  until the offer arrived (never, if STUN was blocked) it sent that peer nothing. Every peer
-  is now recorded on first contact and covered by the fallback routes from the start.
-- Own catch while testing: the 20 s "stuck handshake" timer started when an invite was made,
-  so a human-speed code swap was torn down on accept. It now starts once both sides have each
-  other's description; a joiner waits up to 10 minutes for the host.
-- **Not yet verified in a real LAN skirmish.** Verified in Chrome with the shell's network
-  block (game side stubbed): three tabs, no server, A paired with B and C paired with B, A–C
-  linked on its own; broadcasts and unicasts correct; with A–C cut and blocked, frames went
-  through B both ways; unblocked, A–C relinked in 18 s; B closed, A–C kept going and B was
-  forgotten. With a relay: automatic discovery, and a blocked peer played through the relay.
-  Relay-only and `BroadcastChannel` modes re-checked in Node; `scripts/test_lan_relay.py`.
+    answer can't land on a newer connection. ICE is not trickled; gathering gives up after 5 s.
+  - Resilience: a peer without a direct link still gets every frame, forwarded by a
+    neighbour; links the browser reports `failed` are dropped and retried through the mesh
+    (`disconnected` is left to WebRTC, which recovers it); peers silent for 60 s are forgotten.
+- Dead end: a WebSocket relay (discovery + fallback route) was built and then dropped to keep
+  the port serverless.
+- Dead end that taught the most: slow code swaps. The joiner's ICE agent starts checking the
+  host's candidates as soon as it makes its reply, and nothing answers until the host pastes
+  it: Chromium gives up after about 30 s. Stripping the host's candidates from the invite
+  fixed Chromium (with no pairs it waits, and learns the host from its incoming checks), but
+  Firefox fails an agent with no pairs after a ~5 s grace period. The fix that works in both:
+  keep one placeholder candidate on TEST-NET-1 (192.0.2.x, never routed) pending, adding a
+  fresh one every 3 s, until the link opens. Codes now stay good for 10 minutes.
+- Two adversarial reviews caught: a newcomer the larger-id peer didn't record (one-way until
+  the offer arrived); tearing links down after 10 s `disconnected`, which in a two-player game
+  left no route to re-signal; unanswered invites never closed; a stalled manual handshake
+  blocking the mesh for 10 minutes; a bad or stale pasted code breaking a live link; the
+  panel claiming "copied" when the clipboard refused. All fixed; codes are validated and
+  size-capped, and a virtual-IP clash logs a warning.
+- Built with Emscripten 6.0.2 (the CI recipe, in the `emscripten/emsdk:6.0.2` image): links,
+  no warnings from `udp.cpp`; `GX_Network_PushPacket` exports with 5 arguments. Boots to engine
+  init and stops at the first INI read without game data, as expected.
+- Verified with the shell's network block, game side stubbed:
+  - Firefox 159, Edge 157 and Chromium 152 as one serverless group (Firefox invited Edge,
+    Edge invited Chromium, Firefox–Chromium linked through the mesh); broadcasts and unicasts
+    correct; a 3-minute code swap works with either Firefox or Edge as the joiner.
+  - Chromium, three tabs: with A–C cut and blocked, frames went through B both ways;
+    unblocked, A–C relinked in 26 s; B closed, A–C kept going and B was forgotten.
+  - Node: a `disconnected` link survives the ticks and a `failed` one ends (fails on the
+    previous code).
+- **Not yet verified in a real LAN skirmish**: needs the game data.
