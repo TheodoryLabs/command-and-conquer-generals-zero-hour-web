@@ -1360,7 +1360,12 @@ binaries from backups, then made the from-source build reproducible for the firs
 - Added `scripts/lan_relay.py`, a room-based WebSocket relay: frames go to everyone else in
   the room, unparsed. `?relay=ws://host:8765&room=NAME` switches the page from
   `BroadcastChannel` to it. Same binary frame on both transports.
-- A relay, not WebRTC: it works behind every NAT with no STUN/TURN, and the game's lockstep
-  traffic is small. Peer-to-peer data channels can come later behind the same `sendFrame`.
-- **Not yet verified in a real LAN skirmish.** Verified: `scripts/test_lan_relay.py`, and the
-  shell's network block run in Node across two fake pages over the live relay.
+- Added `&p2p`: a WebRTC mesh, one unordered no-retransmit data channel per peer (UDP-like).
+  The relay doubles as signaling (JSON text frames; binary frames stay game packets). ICE is
+  not trickled; the smaller peer id always offers, so offers never cross. A pair whose P2P link
+  never opens keeps talking through the relay as base64 `pkt` messages, so a strict NAT costs
+  latency, not the match. No TURN server needed for that reason.
+- **Not yet verified in a real LAN skirmish.** Verified: `scripts/test_lan_relay.py`; the
+  shell's network block in Node across two fake pages over the live relay; and in Chrome,
+  two tabs forming a real WebRTC link (0 packets via relay), plus a forced-relay-only peer
+  falling back to the relay in both directions.

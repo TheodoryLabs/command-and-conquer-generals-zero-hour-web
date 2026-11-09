@@ -26,6 +26,8 @@ async def main():
 
     await a.send(b"\x01hello")
     assert await asyncio.wait_for(b.recv(), 1) == b"\x01hello"
+    await a.send('{"type": "hello"}')  # WebRTC signaling is text
+    assert await asyncio.wait_for(b.recv(), 1) == '{"type": "hello"}'
     for ws in (a, c):  # sender and the other room hear nothing
         try:
             await asyncio.wait_for(ws.recv(), 0.3)

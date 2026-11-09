@@ -496,6 +496,8 @@
         // srcIP u32, destIP u32, srcPort u16, destPort u16 (big-endian), then the payload.
         // Default is BroadcastChannel (tabs on one machine). With ?relay=ws://host:8765&room=NAME
         // they go through scripts/lan_relay.py, so every player in the room shares one LAN.
+        // Adding &p2p sends them browser-to-browser over WebRTC data channels instead; the relay
+        // then only introduces peers and carries packets for any pair whose P2P link failed.
         const encodePacket = (srcIP, destIP, srcPort, destPort, payload) => {
           const frame = new Uint8Array(12 + payload.length);
           const view = new DataView(frame.buffer);
@@ -520,16 +522,92 @@
           window.Module._free(ptr);
         };
 
+        // WebRTC mesh: one unordered, no-retransmit data channel (UDP-like) per peer in the room.
+        // Signaling is JSON text over the relay; ICE is not trickled, each side sends its SDP once
+        // gathering finishes. The smaller peer id always makes the offer, so offers never cross.
+        const startPeerMesh = (ws) => {
+          const myId = Math.random().toString(36).slice(2, 10);
+          const iceServers = [{ urls: urlParams.get('stun') || 'stun:stun.l.google.com:19302' }];
+          const peers = new Map(); // peer id -> { pc, dc }
+          const signal = (msg) => {
+            if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(Object.assign({ from: myId }, msg)));
+          };
+          const watchChannel = (peer, dc) => {
+            peer.dc = dc;
+            dc.binaryType = 'arraybuffer';
+            dc.onopen = () => console.log('[GeneralsX] P2P link open');
+            dc.onmessage = (e) => deliverPacket(new Uint8Array(e.data));
+          };
+          const newPeer = (id) => {
+            if (peers.has(id)) peers.get(id).pc.close();
+            const peer = { pc: new RTCPeerConnection({ iceServers: iceServers }), dc: null };
+            peer.pc.ondatachannel = (e) => watchChannel(peer, e.channel);
+            peers.set(id, peer);
+            return peer;
+          };
+          const gathered = (pc) => new Promise((resolve) => {
+            if (pc.iceGatheringState === 'complete') return resolve();
+            pc.addEventListener('icegatheringstatechange', () => {
+              if (pc.iceGatheringState === 'complete') resolve();
+            });
+          });
+          const describe = async (peer, to, type) => {
+            await peer.pc.setLocalDescription(type === 'offer' ? await peer.pc.createOffer() : await peer.pc.createAnswer());
+            await gathered(peer.pc);
+            signal({ type: type, to: to, sdp: peer.pc.localDescription.sdp });
+          };
+
+          ws.onopen = () => signal({ type: 'hello' });
+          ws.onmessage = async (e) => {
+            if (typeof e.data !== 'string') return;
+            const msg = JSON.parse(e.data);
+            if (msg.to !== undefined && ![].concat(msg.to).includes(myId)) return;
+            if (msg.type === 'hello') {
+              if (myId > msg.from) return signal({ type: 'hello', to: msg.from }); // they offer
+              if (peers.has(msg.from)) return;
+              const peer = newPeer(msg.from);
+              watchChannel(peer, peer.pc.createDataChannel('lan', { ordered: false, maxRetransmits: 0 }));
+              await describe(peer, msg.from, 'offer');
+            } else if (msg.type === 'offer') {
+              const peer = newPeer(msg.from);
+              await peer.pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+              await describe(peer, msg.from, 'answer');
+            } else if (msg.type === 'answer' && peers.has(msg.from)) {
+              await peers.get(msg.from).pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+            } else if (msg.type === 'pkt') {
+              deliverPacket(Uint8Array.from(atob(msg.data), (c) => c.charCodeAt(0)));
+            }
+          };
+
+          // Every peer gets every frame (the receiver filters by IP, as on a real LAN).
+          // ponytail: peers that left stay in the map and keep getting relay fallback; prune on a 'bye' if it matters.
+          return (frame) => {
+            const viaRelay = [];
+            peers.forEach((peer, id) => {
+              if (peer.dc && peer.dc.readyState === 'open') {
+                try { peer.dc.send(frame); } catch (err) { /* buffer full: dropped, like UDP */ }
+              } else {
+                viaRelay.push(id);
+              }
+            });
+            if (viaRelay.length) signal({ type: 'pkt', to: viaRelay, data: btoa(String.fromCharCode.apply(null, frame)) });
+          };
+        };
+
         let sendFrame;
         if (relayUrl) {
           const room = encodeURIComponent(urlParams.get('room') || 'lobby');
           const ws = new WebSocket(relayUrl.replace(/\/+$/, '') + '/' + room);
           ws.binaryType = 'arraybuffer';
-          ws.onopen = () => console.log(`[GeneralsX] LAN relay connected: ${relayUrl} room ${room}`);
+          ws.addEventListener('open', () => console.log(`[GeneralsX] LAN relay connected: ${relayUrl} room ${room}`));
           ws.onclose = () => console.warn('[GeneralsX] LAN relay disconnected; reload to rejoin');
-          ws.onmessage = (e) => deliverPacket(new Uint8Array(e.data));
-          // ponytail: packets sent before the socket opens are dropped (UDP semantics); no auto-reconnect.
-          sendFrame = (frame) => { if (ws.readyState === WebSocket.OPEN) ws.send(frame); };
+          if (urlParams.has('p2p')) {
+            sendFrame = startPeerMesh(ws);
+          } else {
+            ws.onmessage = (e) => { if (typeof e.data !== 'string') deliverPacket(new Uint8Array(e.data)); };
+            // ponytail: packets sent before the socket opens are dropped (UDP semantics); no auto-reconnect.
+            sendFrame = (frame) => { if (ws.readyState === WebSocket.OPEN) ws.send(frame); };
+          }
         } else {
           const bc = new BroadcastChannel('generalsx-virtual-lan');
           bc.onmessage = (e) => { if (e.data instanceof Uint8Array) deliverPacket(e.data); };

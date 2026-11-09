@@ -4,14 +4,16 @@
 """
 Virtual-LAN relay for browser multiplayer.
 
-Every browser that connects to ws://HOST:PORT/<room> joins one virtual LAN: each binary
-frame it sends is forwarded to everyone else in the same room. The relay never parses
-frames; the page drops packets not addressed to its own virtual IP.
+Every browser that connects to ws://HOST:PORT/<room> joins one virtual LAN: each frame it
+sends is forwarded to everyone else in the same room. The relay never parses frames; the
+page drops packets not addressed to its own virtual IP. Binary frames are game packets;
+text frames are WebRTC signaling (and fallback packets) for pages opened with &p2p.
 
     pip install websockets
     python3 scripts/lan_relay.py [--host 0.0.0.0] [--port 8765]
 
-Players then open GeneralsZH.html?relay=ws://HOST:8765&room=NAME
+Players then open GeneralsZH.html?relay=ws://HOST:8765&room=NAME      (all traffic via relay)
+               or GeneralsZH.html?relay=ws://HOST:8765&room=NAME&p2p  (browser-to-browser WebRTC)
 """
 
 import argparse
@@ -28,8 +30,9 @@ async def handle(ws):
     peers.add(ws)
     try:
         async for frame in ws:
-            if isinstance(frame, bytes):
-                websockets.broadcast(peers - {ws}, frame)
+            websockets.broadcast(peers - {ws}, frame)
+    except websockets.ConnectionClosed:
+        pass  # a tab closed without a goodbye; nothing to report
     finally:
         peers.discard(ws)
         if not peers:
