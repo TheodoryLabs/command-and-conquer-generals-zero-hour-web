@@ -1409,3 +1409,14 @@ binaries from backups, then made the from-source build reproducible for the firs
 - Verified: both players listed in the LAN lobby, host created a game, the other joined and
   accepted, the match started on Alpine Assault, each built a dozer, and both clocks passed
   1:14 in step with no desync.
+- Saved LAN names came back as their first letter ("Player12" -> "P"): the quoted-printable
+  name codec walked bytes and stopped at the first `00 00`, which with a 4-byte `wchar_t` comes
+  right after the first char. It now walks characters and writes each as two UTF-16LE bytes,
+  the same format the Windows build writes, so existing prefs still load.
+- More players (GPU-rendered headless Edge on one 15 GB machine):
+  - 8 players: 7 code swaps formed a full mesh (all 28 links direct), all 8 shared one LAN
+    lobby and an 8-player game was set up; the match itself did not fit in memory (about
+    1.6 GB per copy) and the host's joins timed out while it was swapped out.
+  - 4 players: mesh, lobby, join, accept and start on Dark Night (4). Two copies then failed
+    from machine limits (one lost its WebGL context, one stalled in swap); the other two kept
+    playing in step. A leave-and-return to the lobby kept the full name.
