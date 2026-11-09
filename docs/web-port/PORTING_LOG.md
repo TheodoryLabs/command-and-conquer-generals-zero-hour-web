@@ -1417,6 +1417,19 @@ binaries from backups, then made the from-source build reproducible for the firs
   one-letter saved LAN name is treated as that damage and replaced by the default (checked in the
   browser: a planted `V_00` loads as `Player11`, a planted `Amir` still loads). The base
   Generals copy of the codec and the same guard are fixed too.
+- Review nits fixed: auto-assigned virtual IPs are now random `10.0.x.y` (253 addresses gave an
+  8-player group about a 10% chance of a clash; now about 0.04%), and the default name is
+  unique per IP (`Player<low 16 bits>` on 10.0.x.y, `P<hex IP>` otherwise). Names with emoji
+  are saved as UTF-16 surrogate pairs, as on Windows, and joined back on 4-byte `wchar_t`.
+- Long matches: game frames are dropped when a channel's send buffer passes 256 KB, as UDP
+  would, instead of piling up seconds of stale frames behind a slow link (the game resends
+  what it needs). Node check: a backed-up channel drops, a drained one sends again.
+- 30-minute match (2 GPU-rendered headless Edge players, auto IPs 10.0.45.179 / 10.0.91.253,
+  default names Player11699 / Player23549): both ordered a unit every 2 minutes for 9 rounds and
+  every order took effect; the link stayed direct, no disconnection screen appeared, and each
+  browser's memory held at 0.7–1.0 GB with no growth.
+- Not covered: a player switching tabs. Browsers pause a background tab's frame loop, and the
+  lockstep game waits for every player, so a hidden tab stalls the match for everyone.
 - More players (GPU-rendered headless Edge on one 15 GB machine):
   - 8 players: 7 code swaps formed a full mesh (all 28 links direct), all 8 shared one LAN
     lobby and an 8-player game was set up; the match itself did not fit in memory (about

@@ -152,8 +152,8 @@ block the local discovery that then relies on; `&stun=stun:host:port` picks anot
 A few strict networks (some mobile carriers, corporate firewalls) block direct WebRTC: such a
 player can still play as long as at least one other player can reach them.
 
-Each player gets a random `10.0.0.x` address; if the console warns of a clash, reload with
-`&ip=10.0.0.N`.
+Each player gets a random `10.0.x.y` address, so a clash is very unlikely; if the console
+warns of one, reload with `&ip=10.0.X.Y` using any numbers nobody else has.
 
 ---
 

@@ -480,9 +480,9 @@
           if (ipParam && /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ipParam)) {
             virtualIP = ipParam.split('.').map(Number);
           } else {
-            // Auto-assign random IP on 10.0.0.X (between 2 and 254)
-            const randomOctet = Math.floor(Math.random() * 253) + 2;
-            virtualIP = [10, 0, 0, randomOctet];
+            // Auto-assign a random 10.0.X.Y. 253 addresses gave an 8-player group about a 10%
+            // chance of two players sharing one; ~65k makes it about 0.04%.
+            virtualIP = [10, 0, Math.floor(Math.random() * 256), Math.floor(Math.random() * 253) + 2];
           }
           console.log(`[GeneralsX] Virtual Networking enabled. Assigned Virtual IP: ${virtualIP.join('.')}`);
         }
@@ -513,7 +513,7 @@
           const isForUs = destIP === 0xFFFFFFFF || destIP === virtualIPInt;
           if (srcIP === virtualIPInt && !deliverPacket.clashWarned) { // no transport echoes our own frames
             deliverPacket.clashWarned = true;
-            console.warn(`[GeneralsX] Another player has virtual IP ${virtualIP.join('.')}; one of you should reload with &ip=10.0.0.N`);
+            console.warn(`[GeneralsX] Another player has virtual IP ${virtualIP.join('.')}; one of you should reload with &ip=10.0.X.Y (any free numbers)`);
           }
           if (!isForUs || srcIP === virtualIPInt) return;
           if (!window.Module || typeof window.Module._GX_Network_PushPacket !== 'function') return;
@@ -546,14 +546,20 @@
           const blank = () => ({ pc: null, lan: null, ctl: null, links: new Set(), heard: Date.now(), deadline: 0, n: null });
           const getPeer = (id) => { if (!peers.has(id)) peers.set(id, blank()); return peers.get(id); };
           const direct = () => [...peers].filter(([, p]) => isOpen(p.ctl)).map(([id]) => id);
+          // Game frames over a backed-up channel are dropped, as UDP would, instead of queueing:
+          // a slow link otherwise piles up seconds of stale frames (up to the browser's ~16 MB
+          // send buffer) and the lockstep game stalls on them. The game resends what it needs.
+          // ponytail: fixed 256 KB cap; tune per link if real networks need it.
+          const backlogged = (ch) => ch.bufferedAmount > 256 * 1024;
 
           const route = (msg) => {
             const json = JSON.stringify(msg);
+            const send = (ch) => { if (msg.type !== 'pkt' || !backlogged(ch)) ch.send(json); };
             try {
               const p = peers.get(msg.to);
-              if (p && isOpen(p.ctl)) return p.ctl.send(json);
+              if (p && isOpen(p.ctl)) return send(p.ctl);
               for (const n of peers.values()) {
-                if (isOpen(n.ctl) && n.links.has(msg.to)) return n.ctl.send(json);
+                if (isOpen(n.ctl) && n.links.has(msg.to)) return send(n.ctl);
               }
               // otherwise unreachable for now: dropped, like UDP; the next tick retries the link
             } catch (err) { /* channel closing or its buffer full: dropped, like UDP */ }
@@ -773,6 +779,7 @@
             let b64 = null;
             peers.forEach((p, id) => {
               if (isOpen(p.lan)) {
+                if (backlogged(p.lan)) return;
                 try { p.lan.send(frame); } catch (err) { /* buffer full: dropped, like UDP */ }
               } else {
                 b64 = b64 || btoa(String.fromCharCode.apply(null, frame));

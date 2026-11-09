@@ -77,7 +77,18 @@ AsciiString UnicodeStringToQuotedPrintable(UnicodeString original)
 	int i=0;
 	while ( *src != 0 && i<1018 )
 	{
-		const unsigned int ch = (unsigned int)*src++;
+		unsigned int ch = (unsigned int)*src++;
+		if (ch > 0xFFFF && ch <= 0x10FFFF)
+		{
+			// Beyond the BMP (emoji): write the UTF-16 surrogate pair Windows would store.
+			if (i >= 1012)
+				break; // both units won't fit; don't write half a pair
+			ch -= 0x10000;
+			const unsigned int hi = 0xD800 | (ch >> 10);
+			appendQuotedByte(dest, i, (unsigned char)(hi & 0xff));
+			appendQuotedByte(dest, i, (unsigned char)(hi >> 8));
+			ch = 0xDC00 | (ch & 0x3FF);
+		}
 		appendQuotedByte(dest, i, (unsigned char)(ch & 0xff));
 		appendQuotedByte(dest, i, (unsigned char)((ch >> 8) & 0xff));
 	}
@@ -151,7 +162,12 @@ UnicodeString QuotedPrintableToUnicodeString(AsciiString original)
 		{
 			if (ch == 0)
 				break;
-			dest[i++] = (WideChar)ch;
+			// Where WideChar holds a full code point, join a UTF-16 surrogate pair back into one.
+			if (sizeof(WideChar) > 2 && ch >= 0xDC00 && ch <= 0xDFFF && i > 0
+				&& (unsigned int)dest[i-1] >= 0xD800 && (unsigned int)dest[i-1] <= 0xDBFF)
+				dest[i-1] = (WideChar)(0x10000 + ((((unsigned int)dest[i-1]) - 0xD800) << 10) + (ch - 0xDC00));
+			else
+				dest[i++] = (WideChar)ch;
 			ch = 0;
 			byteIndex = 0;
 		}
