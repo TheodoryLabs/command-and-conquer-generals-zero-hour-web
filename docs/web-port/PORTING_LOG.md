@@ -1428,8 +1428,14 @@ binaries from backups, then made the from-source build reproducible for the firs
   default names Player11699 / Player23549): both ordered a unit every 2 minutes for 9 rounds and
   every order took effect; the link stayed direct, no disconnection screen appeared, and each
   browser's memory held at 0.7–1.0 GB with no growth.
-- Not covered: a player switching tabs. Browsers pause a background tab's frame loop, and the
-  lockstep game waits for every player, so a hidden tab stalls the match for everyone.
+- Hidden tabs: browsers stop `requestAnimationFrame` in a background tab, so one player switching
+  tabs froze that engine and the lockstep match with it. In a networked game the page now ticks
+  the engine (`GX_TickHidden`) from a Web Worker timer while hidden, one tick in flight at a
+  time so slow frames can't pile up. Single player still pauses. Tested on a fresh 2-player
+  match, counting packets: player 2 sent 401 per 30 s visible and about 204 per 30 s while hidden
+  for 2 minutes, and both players carried on normally afterwards. With the ticker switched off
+  (the old behaviour) it sent almost nothing, and after 1 minute it came back to the
+  Disconnection Menu.
 - More players (GPU-rendered headless Edge on one 15 GB machine):
   - 8 players: 7 code swaps formed a full mesh (all 28 links direct), all 8 shared one LAN
     lobby and an 8-player game was set up; the match itself did not fit in memory (about

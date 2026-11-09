@@ -10,6 +10,7 @@
 #if defined(__EMSCRIPTEN__)
 
 #include "gles3_mainloop.h"
+#include <emscripten/emscripten.h>
 #include <emscripten/html5.h>
 #include <cstdio>
 #include <cmath>
@@ -102,6 +103,13 @@ static void emscripten_main_loop_callback() {
     }
 
     g_Loop.frame_count++;
+}
+
+// GeneralsX @feature 09/11/2026 Browsers stop requestAnimationFrame in a hidden tab, and a lockstep
+// LAN game then stalls for every player. The page calls this from a Web Worker timer (not
+// throttled when hidden) while a networked game's tab is hidden.
+extern "C" EMSCRIPTEN_KEEPALIVE void GX_TickHidden() {
+    emscripten_main_loop_callback();
 }
 
 // ============================================================================

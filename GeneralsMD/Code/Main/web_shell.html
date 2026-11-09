@@ -1427,6 +1427,29 @@
           });
         };
 
+        // A hidden tab gets no requestAnimationFrame, so in a LAN game one player switching tabs
+        // would stall everyone. While hidden, tick the engine from a Web Worker timer, which
+        // browsers don't throttle. Single player keeps pausing in the background.
+        if (virtualNetEnabled) {
+          let ticker = null;
+          document.addEventListener('visibilitychange', () => {
+            if (document.hidden && !ticker) {
+              // One tick in flight: the worker waits for the page's reply before the next, so a
+              // frame slower than 33 ms can't pile ticks up in the page's task queue.
+              ticker = new Worker(URL.createObjectURL(new Blob([
+                'let busy = false; onmessage = () => { busy = false; };' +
+                'setInterval(() => { if (!busy) { busy = true; postMessage(0); } }, 33);'])));
+              ticker.onmessage = () => {
+                if (document.hidden && typeof window.Module._GX_TickHidden === 'function') window.Module._GX_TickHidden();
+                if (ticker) ticker.postMessage(0);
+              };
+            } else if (!document.hidden && ticker) {
+              ticker.terminate();
+              ticker = null;
+            }
+          });
+        }
+
         window.Module = {
           canvas: document.getElementById('canvas'),
           print: printToOutput,
