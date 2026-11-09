@@ -102,14 +102,14 @@ if(EMSCRIPTEN)
             "-sMALLOC=emmalloc"
             # Closure's ADVANCED_OPTIMIZATIONS needs the legacy allocator
             # helpers declared (SDL2's SDL_assert.c EM_ASM references them).
-            "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS','printErr','addFunction','noExitRuntime','UTF8ToString','allocate','ALLOC_NORMAL','intArrayFromString']"
+            "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS','printErr','addFunction','noExitRuntime','UTF8ToString','HEAPU8','allocate','ALLOC_NORMAL','intArrayFromString']"
         )
     else()
         set(GX_PROFILE_FLAGS
             "-O0"
             "-g3"
             "-sASSERTIONS=2"
-            "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS','printErr','addFunction','noExitRuntime','UTF8ToString']"
+            "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS','printErr','addFunction','noExitRuntime','UTF8ToString','HEAPU8']"
         )
     endif()
 

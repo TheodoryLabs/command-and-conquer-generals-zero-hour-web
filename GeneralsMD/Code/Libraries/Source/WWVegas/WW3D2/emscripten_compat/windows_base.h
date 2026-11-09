@@ -675,7 +675,12 @@ typedef struct WSAData {
   unsigned short iMaxUdpDg;
   char *lpVendorInfo;
 } WSADATA, *LPWSADATA;
-inline int WSAStartup(WORD wVersionRequired, LPWSADATA lpWSAData) { return 0; }
+// Report the requested version: callers (Transport::init, IPEnumeration) reject a
+// WSADATA whose wVersion isn't 2.2, and an unset one made the LAN lobby fail to open.
+inline int WSAStartup(WORD wVersionRequired, LPWSADATA lpWSAData) {
+  if (lpWSAData) { memset(lpWSAData, 0, sizeof(*lpWSAData)); lpWSAData->wVersion = lpWSAData->wHighVersion = wVersionRequired; }
+  return 0;
+}
 inline int WSACleanup() { return 0; }
 // Remap WSA error codes to POSIX equivalents for Emscripten socket code.
 // Use #undef to avoid -Wmacro-redefined (these are also defined as numeric

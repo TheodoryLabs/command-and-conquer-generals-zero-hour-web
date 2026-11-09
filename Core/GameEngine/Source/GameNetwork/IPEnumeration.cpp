@@ -180,7 +180,10 @@ AsciiString IPEnumeration::getMachineName()
 	if (g_useVirtualNetworking)
 	{
 		AsciiString str;
-		str.format("VirtualMachine_%d_%d_%d_%d", (int)g_virtualIP_a, (int)g_virtualIP_b, (int)g_virtualIP_c, (int)g_virtualIP_d);
+		// GeneralsX @bugfix 09/11/2026 This is the default LAN player name, which is cut to 12 characters,
+		// so "VirtualMachine_..." made every player "VirtualMachi" and joins failed as duplicate names.
+		// Players share 10.0.0.x, so the last octet keeps the name unique.
+		str.format("Player%d", (int)g_virtualIP_d);
 		return str;
 	}
 	if (!m_isWinsockInitialized)

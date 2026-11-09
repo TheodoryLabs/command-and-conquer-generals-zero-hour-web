@@ -1395,4 +1395,17 @@ binaries from backups, then made the from-source build reproducible for the firs
     unblocked, A–C relinked in 26 s; B closed, A–C kept going and B was forgotten.
   - Node: a `disconnected` link survives the ticks and a `failed` one ends (fails on the
     previous code).
-- **Not yet verified in a real LAN skirmish**: needs the game data.
+- A real LAN match (Steam Zero Hour data, two headless Edge players paired with `?p2p`) found
+  four existing bugs that stopped the browser LAN before any packet left, all fixed:
+  - `WSAStartup` shim returned 0 without filling `wVersion`, so `Transport::init` failed its
+    2.2 check and the lobby showed "Failed trying to communicate with the network".
+  - `wchar_t` is 4 bytes in wasm, so `LANMessage` is 536 bytes; `Transport::queueSend` dropped
+    everything over the retail 476 (the `static_assert` is compiled out for Emscripten). Web
+    builds now accept up to what `doRecv` reads back.
+  - `HEAPU8` was not exported, so the first `UDP::Write` aborted; now in
+    `EXPORTED_RUNTIME_METHODS`, and the `EM_ASM` reads `Module['HEAPU8']` (Closure-safe).
+  - The default name `VirtualMachine_a_b_c_d` is cut to 12 characters, so every player was
+    "VirtualMachi" and joins failed as duplicate names; it is now `Player<last octet>`.
+- Verified: both players listed in the LAN lobby, host created a game, the other joined and
+  accepted, the match started on Alpine Assault, each built a dozer, and both clocks passed
+  1:14 in step with no desync.

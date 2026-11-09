@@ -286,7 +286,7 @@ Int UDP::Write(const unsigned char *msg, UnsignedInt len, UnsignedInt IP,
     EM_ASM({
       if (typeof window !== 'undefined' && window['GeneralsX'] &&
           typeof window['GeneralsX']['onSendPacket'] === 'function') {
-        var data = new Uint8Array(Module.HEAPU8.buffer, $0, $1);
+        var data = new Uint8Array(Module['HEAPU8'].buffer, $0, $1);
         var copy = new Uint8Array(data);
         window['GeneralsX']['onSendPacket'](copy, $2, $3, $4);
       }
