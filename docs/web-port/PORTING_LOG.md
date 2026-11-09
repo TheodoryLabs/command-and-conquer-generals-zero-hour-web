@@ -1413,6 +1413,10 @@ binaries from backups, then made the from-source build reproducible for the firs
   name codec walked bytes and stopped at the first `00 00`, which with a 4-byte `wchar_t` comes
   right after the first char. It now walks characters and writes each as two UTF-16LE bytes,
   the same format the Windows build writes, so existing prefs still load.
+  Names already saved by the old encoder load as one letter, so on 4-byte `wchar_t` builds a
+  one-letter saved LAN name is treated as that damage and replaced by the default (checked in the
+  browser: a planted `V_00` loads as `Player11`, a planted `Amir` still loads). The base
+  Generals copy of the codec and the same guard are fixed too.
 - More players (GPU-rendered headless Edge on one 15 GB machine):
   - 8 players: 7 code swaps formed a full mesh (all 28 links direct), all 8 shared one LAN
     lobby and an 8-player game was set up; the match itself did not fit in memory (about

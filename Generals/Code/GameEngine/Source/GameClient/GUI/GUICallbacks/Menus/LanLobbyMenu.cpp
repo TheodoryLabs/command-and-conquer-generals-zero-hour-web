@@ -103,7 +103,12 @@ UnicodeString LANPreferences::getUserName()
 		// Found an user name. Use it if valid.
 		ret = QuotedPrintableToUnicodeString(it->second);
 		ret.trim();
-		if (!ret.isEmpty())
+		// GeneralsX @bugfix 09/11/2026 Where wchar_t is 4 bytes, the old name encoder saved only the
+		// first letter ("Player12" as "P"), so every such player loaded the same one-letter name and
+		// joins failed as duplicates. Treat a one-letter saved name there as that damage and fall back
+		// to the default below; a real one-letter name only loses being remembered.
+		const Bool legacyTruncated = sizeof(WideChar) > 2 && ret.getLength() == 1;
+		if (!ret.isEmpty() && !legacyTruncated)
 		{
 			return ret;
 		}
