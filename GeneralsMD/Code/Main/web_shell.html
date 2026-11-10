@@ -516,7 +516,9 @@
             console.warn(`[GeneralsX] Another player has virtual IP ${virtualIP.join('.')}; one of you should reload with &ip=10.0.X.Y (any free numbers)`);
           }
           if (!isForUs || srcIP === virtualIPInt) return;
-          if (!window.Module || typeof window.Module._GX_Network_PushPacket !== 'function') return;
+          // Frames from players already in the lobby can arrive while this page is still loading
+          // the game; drop them (like UDP) until the runtime is up, or _malloc aborts the page.
+          if (!window.Module || !window.Module.gxNetReady) return;
           const payload = frame.subarray(12);
           const ptr = window.Module._malloc(payload.length);
           window.Module.HEAPU8.set(payload, ptr);
@@ -1456,6 +1458,7 @@
           printErr: printErrToOutput,
           preRun: [idbfsPreRun],
           onRuntimeInitialized: function () {
+            window.Module.gxNetReady = true;
             if (virtualNetEnabled) {
               console.log(`[GeneralsX] Enabling virtual networking with IP: ${virtualIP.join('.')}`);
               if (typeof window.Module._GX_Network_EnableVirtual === 'function') {
