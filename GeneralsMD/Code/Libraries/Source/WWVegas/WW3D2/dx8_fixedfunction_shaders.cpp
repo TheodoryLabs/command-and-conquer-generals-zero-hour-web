@@ -58,8 +58,15 @@ layout(location = 7) in mat4 a_InstanceWorld; // Instanced matrix layout locatio
 uniform mat4 u_World;
 uniform mat4 u_View;
 uniform mat4 u_Projection;
-uniform mat4 u_TexMatrix0;
 uniform bool u_InstancingEnabled;
+
+// Per-stage texture coordinates, as D3D8 fixed function builds them:
+// D3DTSS_TEXCOORDINDEX (low bits: UV set, high 16 bits: D3DTSS_TCI_* generation mode),
+// D3DTSS_TEXTURETRANSFORMFLAGS (D3DTTFF_COUNTn | D3DTTFF_PROJECTED) and D3DTS_TEXTUREn.
+// The shroud, cloud shadows and projected decals use camera-space generation.
+uniform int u_TexCoordIndex[4];
+uniform int u_TexTransform[4];
+uniform mat4 u_TexMatrix[4];
 
 // Material
 uniform vec4 u_MatDiffuse;
@@ -96,11 +103,31 @@ uniform bool u_ColorVertex;
 
 // Outputs to fragment shader
 out vec4 v_Color;
-out vec2 v_TexCoord0;
-out vec2 v_TexCoord1;
-out vec2 v_TexCoord2;
-out vec2 v_TexCoord3;
+out vec3 v_TexCoord0; // xy, and the divisor for D3DTTFF_PROJECTED (else 1)
+out vec3 v_TexCoord1;
+out vec3 v_TexCoord2;
+out vec3 v_TexCoord3;
 out float v_FogFactor;
+
+vec3 stage_texcoord(int i, vec3 eyePos, vec3 eyeNormal) {
+    int tci = u_TexCoordIndex[i];
+    int mode = tci >> 16;
+    vec4 c;
+    if (mode == 1) c = vec4(eyeNormal, 1.0);                              // CAMERASPACENORMAL
+    else if (mode == 2) c = vec4(eyePos, 1.0);                            // CAMERASPACEPOSITION
+    else if (mode == 3) c = vec4(reflect(normalize(eyePos), eyeNormal), 1.0); // REFLECTIONVECTOR
+    else {
+        int set = tci & 3;
+        vec2 uv = set == 0 ? a_TexCoord0 : set == 1 ? a_TexCoord1 : set == 2 ? a_TexCoord2 : a_TexCoord3;
+        c = vec4(uv, 1.0, 0.0); // D3D puts the 2D translation in the matrix's third row
+    }
+    int count = u_TexTransform[i] & 0xff;
+    if (count == 0) return vec3(c.xy, 1.0);
+    vec4 t = u_TexMatrix[i] * c;
+    float q = 1.0;
+    if ((u_TexTransform[i] & 256) != 0) q = count == 4 ? t.w : count == 3 ? t.z : t.y;
+    return vec3(t.xy, q);
+}
 
 void main() {
     mat4 worldMat = u_World;
@@ -120,11 +147,11 @@ void main() {
     // We need to swap R and B channels.
     vec4 vertexColor = a_Color.bgra;
 
-    // Pass texture coordinates (with optional texture matrix transform)
-    v_TexCoord0 = a_TexCoord0;
-    v_TexCoord1 = a_TexCoord1;
-    v_TexCoord2 = a_TexCoord2;
-    v_TexCoord3 = a_TexCoord3;
+    vec3 eyeNormal = normalize(mat3(u_View) * (mat3(worldMat) * a_Normal));
+    v_TexCoord0 = stage_texcoord(0, viewPos.xyz, eyeNormal);
+    v_TexCoord1 = stage_texcoord(1, viewPos.xyz, eyeNormal);
+    v_TexCoord2 = stage_texcoord(2, viewPos.xyz, eyeNormal);
+    v_TexCoord3 = stage_texcoord(3, viewPos.xyz, eyeNormal);
 
     // Compute lighting
     if (u_LightingEnabled) {
@@ -207,10 +234,10 @@ precision highp float;
 
 // Inputs from vertex shader
 in vec4 v_Color;
-in vec2 v_TexCoord0;
-in vec2 v_TexCoord1;
-in vec2 v_TexCoord2;
-in vec2 v_TexCoord3;
+in vec3 v_TexCoord0;
+in vec3 v_TexCoord1;
+in vec3 v_TexCoord2;
+in vec3 v_TexCoord3;
 in float v_FogFactor;
 
 // Texture samplers
@@ -303,7 +330,7 @@ void main() {
 
     // --- Texture Stage 0 ---
     if (u_TextureStageCount >= 1) {
-        vec4 tex0 = texture(u_Texture0, v_TexCoord0);
+        vec4 tex0 = texture(u_Texture0, v_TexCoord0.xy / v_TexCoord0.z);
         // Default operation: MODULATE (texture × diffuse)
         color.rgb = apply_color_op(u_Stage0_ColorOp, tex0, color);
         color.a   = apply_alpha_op(u_Stage0_AlphaOp, tex0.a, color.a);
@@ -311,20 +338,20 @@ void main() {
 
     // --- Texture Stage 1 (lightmaps, detail textures) ---
     if (u_TextureStageCount >= 2) {
-        vec4 tex1 = texture(u_Texture1, v_TexCoord1);
+        vec4 tex1 = texture(u_Texture1, v_TexCoord1.xy / v_TexCoord1.z);
         color.rgb = apply_color_op(u_Stage1_ColorOp, tex1, color);
         color.a   = apply_alpha_op(u_Stage1_AlphaOp, tex1.a, color.a);
     }
 
     // --- Texture Stage 2 (rare — special effects) ---
     if (u_TextureStageCount >= 3) {
-        vec4 tex2 = texture(u_Texture2, v_TexCoord2);
+        vec4 tex2 = texture(u_Texture2, v_TexCoord2.xy / v_TexCoord2.z);
         color.rgb *= tex2.rgb;  // MODULATE
     }
 
     // --- Texture Stage 3 (very rare) ---
     if (u_TextureStageCount >= 4) {
-        vec4 tex3 = texture(u_Texture3, v_TexCoord3);
+        vec4 tex3 = texture(u_Texture3, v_TexCoord3.xy / v_TexCoord3.z);
         color.rgb *= tex3.rgb;
     }
 

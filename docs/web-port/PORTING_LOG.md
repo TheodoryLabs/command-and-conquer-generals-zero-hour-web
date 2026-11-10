@@ -1443,3 +1443,43 @@ binaries from backups, then made the from-source build reproducible for the firs
   - 4 players: mesh, lobby, join, accept and start on Dark Night (4). Two copies then failed
     from machine limits (one lost its WebGL context, one stalled in swap); the other two kept
     playing in step. A leave-and-return to the lobby kept the full name.
+
+## 2026-11-10 — Session 16: In-game rendering — shroud, terrain, minimap, colours
+
+Reported in Edge (ANGLE on OpenGL, AMD RX 580, Mesa 25.2) and reproduced in headless Edge with
+`--use-angle=gl` at 1873x1035 on Alpine Assault (one-player LAN game): blocky stair-step shroud,
+black dashes across the terrain, dark stretched patches on cliffs, and a black, streaked minimap.
+Five emulation bugs, all in the DX8 → WebGL2 layer:
+
+- **No texture coordinate generation.** The shroud (and cloud shadows, the terrain noise pass,
+  projected decals) asks D3D to build texcoords from the camera-space position
+  (`D3DTSS_TCI_CAMERASPACEPOSITION`) through `D3DTS_TEXTUREn` (`D3DTTFF_COUNTn`). The shader
+  ignored `D3DTSS_TEXCOORDINDEX` and the texture matrices, so the shroud pass multiplied the
+  terrain by shroud texels picked with the terrain tiles' UVs: that was the black dashes, the dark
+  cliff patches and the shroud's shape. The vertex shader now does D3D8's per-stage texcoords
+  (UV set selection, camera-space normal / position / reflection, texture matrix, `PROJECTED`
+  divided per fragment). Stage defaults are D3D's (`TEXCOORDINDEX` = stage).
+- **Wrong `D3DTSS_*` numbers** in `emscripten_compat/d3d8types.h`: MIN/MAG filter swapped,
+  bump-env, border colour, ADDRESSW, COLORARG0/ALPHAARG0 and `TEXTURETRANSFORMFLAGS` (124
+  instead of 24) off. `DX8Wrapper::TextureStageStates[stage][32]` was indexed out of bounds with
+  124/125, and the GLES3 layer, which reads the real numbers, never saw transform flags while
+  the bump matrix landed on slot 24. All now match D3D8.
+- **No linear filtering in the caps.** `TextureFilterCaps` was 0, so `TextureFilterClass` mapped
+  `FILTER_TYPE_BEST`/`DEFAULT` to POINT: the shroud's stair steps (and point-sampled fonts).
+  The caps now report MIN/MAG linear and MIP linear/point.
+- **Minimap texture format.** The radar picks `D3DFMT_R8G8B8` first; the upload had no case for
+  it and sent the 3-byte buffer as 4-byte RGBA (`Unknown DX8 texture format 20`), hence black
+  with streaks.
+- **WebGL2 has no texture swizzle.** `GL_TEXTURE_SWIZZLE_*` fails with INVALID_ENUM (257 errors
+  per run), so every uncompressed A8R8G8B8 / X8R8G8B8 texture was sampled with red and blue
+  swapped (the menu's blue night scene and orange UI were really the sunny desert shellmap and
+  Zero Hour's blue UI), and L8 / A8 / A8L8 read the wrong channels. `To_GL_Pixels` now converts
+  channel order on the CPU for both create and update, and replaces the two copies of that code.
+- Also: `LockRect` ignored `pRect` (D3D points `pBits` at the rect's first pixel); fixed for
+  textures and surfaces, used by `SurfaceClass::Lock(min,max)` and the font column tests.
+
+Verified (same map, USA, same start, headless Edge on ANGLE-GL 1873x1035, before = deployed
+build): shroud edges and the map edge fade softly, no black dashes, cliffs show rock instead of
+dark smears, the minimap shows the terrain with its shroud, and the menu and control bar
+have their real colours. Not fixed: some terrain blend tiles (snow patches) still have hard
+cell edges; that was the same before, and it's the 2-stage terrain blend pass, a separate issue.

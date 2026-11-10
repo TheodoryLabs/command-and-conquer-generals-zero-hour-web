@@ -601,15 +601,17 @@ struct Emscripten_IDirect3DTexture8 : public IDirect3DTexture8 {
     virtual DWORD GetLOD()        override { return 0; }
 
     virtual HRESULT LockRect(UINT Level, D3DLOCKED_RECT *pLockedRect,
-                             const RECT *, DWORD) override {
+                             const RECT *pRect, DWORD) override {
         if (!pLockedRect) return 0;
         if (Level >= LevelCount || levels[Level].pixels.empty()) {
             pLockedRect->pBits = nullptr;
             pLockedRect->Pitch = 0;
             return 0;
         }
-        pLockedRect->pBits  = levels[Level].pixels.data();
         pLockedRect->Pitch  = (int)(levels[Level].w * BPP);
+        // D3D points pBits at the locked rect's first pixel, not the surface's.
+        pLockedRect->pBits  = levels[Level].pixels.data() +
+            (pRect ? pRect->top * pLockedRect->Pitch + pRect->left * BPP : 0);
         return 0;
     }
 
@@ -663,7 +665,7 @@ inline ULONG Emscripten_IDirect3DSurface8::Release() {
     return r;
 }
 
-inline HRESULT Emscripten_IDirect3DSurface8::LockRect(D3DLOCKED_RECT *pLockedRect, const RECT *, DWORD) {
+inline HRESULT Emscripten_IDirect3DSurface8::LockRect(D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD) {
     if (pLockedRect) {
         if (ParentTexture) {
             if (ParentLevel < ParentTexture->LevelCount && !ParentTexture->levels[ParentLevel].pixels.empty()) {
@@ -680,6 +682,10 @@ inline HRESULT Emscripten_IDirect3DSurface8::LockRect(D3DLOCKED_RECT *pLockedRec
             pLockedRect->Pitch = 0;
             pLockedRect->pBits = nullptr;
         }
+        // D3D points pBits at the locked rect's first pixel, not the surface's.
+        if (pRect && pLockedRect->pBits)
+            pLockedRect->pBits = (uint8_t *)pLockedRect->pBits +
+                pRect->top * pLockedRect->Pitch + pRect->left * BytesPerPixel;
     }
     return 0;
 }
@@ -807,6 +813,10 @@ struct Emscripten_IDirect3DDevice8 : public IDirect3DDevice8 {
             pCaps->TextureOpCaps       = 0x03FFFFFF; // support all common tex ops
             pCaps->RasterCaps          = D3DPRASTERCAPS_FOGTABLE | D3DPRASTERCAPS_FOGVERTEX |
                                          D3DPRASTERCAPS_WFOG;
+            // GL has bilinear and mip filtering; without these caps TextureFilterClass
+            // maps FILTER_TYPE_BEST (the default) to POINT, e.g. a blocky shroud.
+            pCaps->TextureFilterCaps   = D3DPTFILTERCAPS_MINFLINEAR | D3DPTFILTERCAPS_MAGFLINEAR |
+                                         D3DPTFILTERCAPS_MIPFLINEAR | D3DPTFILTERCAPS_MIPFPOINT;
             pCaps->SrcBlendCaps        = 0x00003FFF;
             pCaps->DestBlendCaps       = 0x00003FFF;
             pCaps->TextureCaps         = D3DPTEXTURECAPS_PROJECTED | D3DPTEXTURECAPS_CUBEMAP;
@@ -1288,6 +1298,10 @@ struct Emscripten_IDirect3D8 : public IDirect3D8 {
             pCaps->TextureOpCaps       = 0x03FFFFFF;
             pCaps->RasterCaps          = D3DPRASTERCAPS_FOGTABLE | D3DPRASTERCAPS_FOGVERTEX |
                                          D3DPRASTERCAPS_WFOG;
+            // GL has bilinear and mip filtering; without these caps TextureFilterClass
+            // maps FILTER_TYPE_BEST (the default) to POINT, e.g. a blocky shroud.
+            pCaps->TextureFilterCaps   = D3DPTFILTERCAPS_MINFLINEAR | D3DPTFILTERCAPS_MAGFLINEAR |
+                                         D3DPTFILTERCAPS_MIPFLINEAR | D3DPTFILTERCAPS_MIPFPOINT;
             pCaps->SrcBlendCaps        = 0x00003FFF;
             pCaps->DestBlendCaps       = 0x00003FFF;
             pCaps->TextureCaps         = D3DPTEXTURECAPS_PROJECTED | D3DPTEXTURECAPS_CUBEMAP;

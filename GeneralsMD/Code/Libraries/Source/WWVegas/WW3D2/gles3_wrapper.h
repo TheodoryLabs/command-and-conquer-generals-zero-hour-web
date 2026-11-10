@@ -290,6 +290,9 @@ struct GLES3_ProgramUniformLocations {
   GLint u_ColorVertex;
   GLint u_TextureFactor;
   GLint u_InstancingEnabled;
+  GLint u_TexCoordIndex;
+  GLint u_TexTransform;
+  GLint u_TexMatrix;
 };
 
 
