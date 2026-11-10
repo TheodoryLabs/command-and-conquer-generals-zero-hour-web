@@ -1126,8 +1126,11 @@
         const gxLockCanvasBacking = function () {
           const canvasEl = document.getElementById('canvas');
           if (!canvasEl) return;
-          if (canvasEl.width !== GX_FIXED_W) canvasEl.width = GX_FIXED_W;
-          if (canvasEl.height !== GX_FIXED_H) canvasEl.height = GX_FIXED_H;
+          // The engine sizes the canvas to its display mode (d3d8.h Size_Canvas).
+          const M = window.Module || {};
+          const w = M.gxCanvasW || GX_FIXED_W, h = M.gxCanvasH || GX_FIXED_H;
+          if (canvasEl.width !== w) canvasEl.width = w;
+          if (canvasEl.height !== h) canvasEl.height = h;
         };
         gxLockCanvasBacking();
         // Re-pin on any resize-like event Emscripten may trigger.

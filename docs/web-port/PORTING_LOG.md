@@ -1483,3 +1483,37 @@ build): shroud edges and the map edge fade softly, no black dashes, cliffs show 
 dark smears, the minimap shows the terrain with its shroud, and the menu and control bar
 have their real colours. Not fixed: some terrain blend tiles (snow patches) still have hard
 cell edges; that was the same before, and it's the 2-stage terrain blend pass, a separate issue.
+
+## 2026-11-10 — Session 17: Black infantry, resolution lock, detail level
+
+Three reports from the live server: infantry render as black silhouettes, the resolution is
+stuck at the smallest mode, and higher detail levels don't take. Reproduced and verified in
+headless Edge (`--use-angle=gl`) with a LAN game on Alpine Assault (USA, Rangers from a barracks).
+
+- **Black infantry: recoloured textures were empty.** Team-coloured textures (infantry) are copies
+  made by `W3DAssetManager::Recolor_Texture_One_Time`, which builds a texture from a surface
+  through `D3DXLoadSurfaceFromSurface`. That was a `return 0` stub, so the copies stayed all
+  zero (read back from GL: RGBA 0). It now copies, point-sampling between the rects and
+  converting between the 16/24/32-bit RGB formats. `SurfaceClass::Copy` across formats and the
+  missing-texture surface used the same stub.
+- **Material colour source.** The vertex shader took ambient and diffuse from the vertex colour
+  whenever `D3DRS_COLORVERTEX` was on. D3D only does that per `D3DRS_{AMBIENT,DIFFUSE,EMISSIVE}MATERIALSOURCE`
+  = `D3DMCS_COLOR1`, and only when the vertex has a diffuse colour. Skinned meshes always carry
+  one (0 when the mesh has none) with the material as source, so they came out black even once
+  textured. The GLES3 layer now passes the three sources as a bitmask. Its render-state cache
+  must start at 0 like `DX8Wrapper::RenderStates`: the wrapper drops a "change" to a value it
+  already holds, so seeding D3D's own defaults there made them stick.
+- **Resolution.** The shim offered one mode and `web_shell.html` pinned the canvas to 800x600,
+  CSS-scaled. The device now lists the usual modes from 800x600 to 3840x2160 plus the screen's
+  size; `CreateDevice`/`Reset` size the canvas backing store to the back buffer and set its CSS
+  aspect ratio, and the page's lock follows `Module.gxCanvasW/H`. The engine re-lays out its UI
+  for the mode, mouse mapping already scales to `TheDisplay`, and the choice persists in
+  `Options.ini`.
+- **Detail level.** `CPUDetectClass::Init_Memory` only ran when CPUID exists, never on wasm, so
+  RAM read 0 MB: `GameLODManager` failed its 256 MB check, which forces low-res textures, turns
+  trees and the shell map off, and recommends Low. It now runs unconditionally (the web build
+  reports 1 GB).
+
+Verified: Rangers are textured with their team colour; vehicles keep theirs; Options lists the
+modes, 1280x720 applies at once (16:9 canvas, UI re-laid out, clicks land) and survives a
+reload; Very High sticks; the shell map now plays behind the main menu.

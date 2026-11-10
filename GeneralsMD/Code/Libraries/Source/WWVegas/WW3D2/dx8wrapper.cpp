@@ -298,6 +298,7 @@ void MoveRectIntoOtherRect(const RECT &inner, const RECT &outer, int *x,
 }
 
 #ifdef __EMSCRIPTEN__
+#include <emscripten.h>
 extern "C" IDirect3D8 *Direct3DCreate8(UINT SDKVersion) {
     static Emscripten_IDirect3D8 s_d3d8;
     return &s_d3d8;
@@ -371,8 +372,24 @@ bool DX8Wrapper::Init(void *hwnd, bool lite) {
     _RenderDeviceNameTable.Add(device_name);
     _RenderDeviceShortNameTable.Add(device_name);
 
+    // The canvas can take any size, so offer the usual monitor modes plus the
+    // screen's own (W3DDisplay drops anything under 800 wide). The canvas
+    // backing store follows the chosen mode in CreateDevice/Reset.
     RenderDeviceDescClass desc;
-    desc.add_resolution(1024, 768, 32);
+    static const int modes[][2] = {
+        {800, 600},   {1024, 768},  {1152, 864},  {1280, 720},  {1280, 800},
+        {1280, 1024}, {1366, 768},  {1440, 900},  {1600, 900},  {1600, 1200},
+        {1680, 1050}, {1920, 1080}, {1920, 1200}, {2560, 1080}, {2560, 1440},
+        {3440, 1440}, {3840, 2160}};
+    const int screen_w = EM_ASM_INT({ return (screen.width * (window.devicePixelRatio || 1)) | 0; });
+    const int screen_h = EM_ASM_INT({ return (screen.height * (window.devicePixelRatio || 1)) | 0; });
+    bool have_screen = false;
+    for (const auto &m : modes) {
+      desc.add_resolution(m[0], m[1], 32);
+      have_screen |= (m[0] == screen_w && m[1] == screen_h);
+    }
+    if (!have_screen && screen_w >= 800 && screen_h >= 600)
+      desc.add_resolution(screen_w, screen_h, 32);
     _RenderDeviceDescriptionTable.Add(desc);
 
     // Enumerate devices (even if dummy, to fill tables)

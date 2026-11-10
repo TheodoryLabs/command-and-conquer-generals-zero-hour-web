@@ -20,6 +20,7 @@
 #if defined(__EMSCRIPTEN__)
 
 #include "gles3_fvf.h"
+#include "gles3_wrapper.h"
 #include <cstring>
 #include <cstdio>
 
@@ -208,6 +209,7 @@ void GLES3_FVFDecoder::Apply_Vertex_Attribs(unsigned int stride,
     // GL_UNSIGNED_BYTE with GL_TRUE normalization maps 0-255 → 0.0-1.0.
     // WebGL2 does NOT support GL_BGRA, so we pass as GL_RGBA and swizzle
     // in the vertex shader (swap .r and .b).
+    GLES3_Set_Vertex_Has_Color((fvf & D3DFVF_DIFFUSE) != 0);
     if (fvf & D3DFVF_DIFFUSE) {
         glEnableVertexAttribArray(ATTR_COLOR);
         glVertexAttribPointer(

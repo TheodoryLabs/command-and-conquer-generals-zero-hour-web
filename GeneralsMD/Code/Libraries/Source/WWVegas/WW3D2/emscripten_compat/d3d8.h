@@ -18,6 +18,9 @@
 #include <vector>
 #include <cstdint>
 #include <cstring>
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 // Forward declaration — defined in gles3_wrapper.cpp (which has SDL access)
 void GLES3_Swap_Buffers();
 
@@ -831,7 +834,26 @@ struct Emscripten_IDirect3DDevice8 : public IDirect3DDevice8 {
         return 0;
     }
     virtual HRESULT GetDisplayMode(D3DDISPLAYMODE *pMode) override { return 0; }
-    virtual HRESULT Reset(D3DPRESENT_PARAMETERS *pParams) override { return 0; }
+    virtual HRESULT Reset(D3DPRESENT_PARAMETERS *pParams) override {
+        Size_Canvas(pParams);
+        return 0;
+    }
+    // The GL back buffer is the canvas backing store: give it the engine's
+    // resolution, and let the page letterbox it at that aspect ratio.
+    static void Size_Canvas(const D3DPRESENT_PARAMETERS *pParams) {
+#ifdef __EMSCRIPTEN__
+        if (!pParams || pParams->BackBufferWidth < 1 || pParams->BackBufferHeight < 1) return;
+        EM_ASM({
+            Module.gxCanvasW = $0;
+            Module.gxCanvasH = $1;
+            var c = document.getElementById('canvas');
+            if (!c) return;
+            c.width = $0;
+            c.height = $1;
+            c.style.aspectRatio = $0 + ' / ' + $1;
+        }, (int)pParams->BackBufferWidth, (int)pParams->BackBufferHeight);
+#endif
+    }
     virtual HRESULT Present(const RECT *pSrc, const RECT *pDst, void *hDstWnd,
                           const RGNDATA *pDirtyRgn) override {
         GLES3_Swap_Buffers();
@@ -1275,6 +1297,7 @@ struct Emscripten_IDirect3D8 : public IDirect3D8 {
                                D3DPRESENT_PARAMETERS *pParams,
                                IDirect3DDevice8 **ppDevice) override { 
         *ppDevice = new Emscripten_IDirect3DDevice8();
+        Emscripten_IDirect3DDevice8::Size_Canvas(pParams);
         return 0; 
     }
     virtual HRESULT GetDeviceCaps(UINT Adapter, DWORD DeviceType,
@@ -1362,11 +1385,75 @@ inline HRESULT D3DXCreateTextureFromFileExA(
   return 0;
 }
 
+// Pixel <-> A8R8G8B8 for the uncompressed formats surfaces use.
+static inline bool D3DX_Read_ARGB(D3DFORMAT f, const uint8_t *p, uint32_t &c) {
+  uint32_t v;
+  switch (f) {
+  case D3DFMT_A8R8G8B8: memcpy(&c, p, 4); return true;
+  case D3DFMT_X8R8G8B8: memcpy(&c, p, 4); c |= 0xff000000u; return true;
+  case D3DFMT_R8G8B8: c = 0xff000000u | (p[2] << 16) | (p[1] << 8) | p[0]; return true;
+  case D3DFMT_R5G6B5: v = p[0] | (p[1] << 8);
+    c = 0xff000000u | (((v >> 11) & 31) * 255 / 31) << 16 | (((v >> 5) & 63) * 255 / 63) << 8 | ((v & 31) * 255 / 31); return true;
+  case D3DFMT_A1R5G5B5: v = p[0] | (p[1] << 8);
+    c = ((v & 0x8000) ? 0xff000000u : 0) | (((v >> 10) & 31) * 255 / 31) << 16 | (((v >> 5) & 31) * 255 / 31) << 8 | ((v & 31) * 255 / 31); return true;
+  case D3DFMT_A4R4G4B4: v = p[0] | (p[1] << 8);
+    c = ((v >> 12) & 15) * 17u << 24 | ((v >> 8) & 15) * 17u << 16 | ((v >> 4) & 15) * 17u << 8 | (v & 15) * 17u; return true;
+  default: return false;
+  }
+}
+static inline bool D3DX_Write_ARGB(D3DFORMAT f, uint8_t *p, uint32_t c) {
+  const uint32_t a = c >> 24, r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255;
+  uint32_t v;
+  switch (f) {
+  case D3DFMT_A8R8G8B8: case D3DFMT_X8R8G8B8: memcpy(p, &c, 4); return true;
+  case D3DFMT_R8G8B8: p[0] = b; p[1] = g; p[2] = r; return true;
+  case D3DFMT_R5G6B5: v = (r >> 3) << 11 | (g >> 2) << 5 | (b >> 3); break;
+  case D3DFMT_A1R5G5B5: v = (a >= 128 ? 0x8000 : 0) | (r >> 3) << 10 | (g >> 3) << 5 | (b >> 3); break;
+  case D3DFMT_A4R4G4B4: v = (a >> 4) << 12 | (r >> 4) << 8 | (g >> 4) << 4 | (b >> 4); break;
+  default: return false;
+  }
+  p[0] = v & 255; p[1] = v >> 8;
+  return true;
+}
+
+// Copies (and point-samples, if the rects differ in size) a surface into another.
+// W3D builds textures from surfaces this way, e.g. the team-coloured copies of
+// infantry textures; a no-op left them all black.
 inline HRESULT
 D3DXLoadSurfaceFromSurface(void *pDestSurface, const void *pDestPalette,
                            const RECT *pDestRect, void *pSrcSurface,
                            const void *pSrcPalette, const RECT *pSrcRect,
                            DWORD Filter, D3DCOLOR ColorKey) {
+  auto *dst = static_cast<Emscripten_IDirect3DSurface8 *>(static_cast<IDirect3DSurface8 *>(pDestSurface));
+  auto *src = static_cast<Emscripten_IDirect3DSurface8 *>(static_cast<IDirect3DSurface8 *>(pSrcSurface));
+  if (!dst || !src) return 0;
+  const RECT sr = pSrcRect ? *pSrcRect : RECT{0, 0, (LONG)src->Width, (LONG)src->Height};
+  const RECT dr = pDestRect ? *pDestRect : RECT{0, 0, (LONG)dst->Width, (LONG)dst->Height};
+  const int sw = sr.right - sr.left, sh = sr.bottom - sr.top;
+  const int dw = dr.right - dr.left, dh = dr.bottom - dr.top;
+  if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return 0;
+  D3DLOCKED_RECT sl, dl;
+  src->LockRect(&sl, nullptr, 0);
+  dst->LockRect(&dl, nullptr, 0);
+  const uint8_t *sp = (const uint8_t *)sl.pBits;
+  uint8_t *dp = (uint8_t *)dl.pBits;
+  const UINT sb = src->BytesPerPixel, db = dst->BytesPerPixel;
+  const bool same = src->Format == dst->Format;
+  if (sp && dp) {
+    for (int y = 0; y < dh; ++y) {
+      const uint8_t *srow = sp + (size_t)(sr.top + y * sh / dh) * sl.Pitch;
+      uint8_t *drow = dp + (size_t)(dr.top + y) * dl.Pitch;
+      for (int x = 0; x < dw; ++x) {
+        const uint8_t *s = srow + (size_t)(sr.left + x * sw / dw) * sb;
+        uint8_t *d = drow + (size_t)(dr.left + x) * db;
+        uint32_t c;
+        if (same) memcpy(d, s, db);
+        else if (D3DX_Read_ARGB(src->Format, s, c)) D3DX_Write_ARGB(dst->Format, d, c);
+      }
+    }
+  }
+  src->UnlockRect();
+  dst->UnlockRect();
   return 0;
 }
 

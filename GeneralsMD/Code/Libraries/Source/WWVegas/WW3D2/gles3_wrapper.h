@@ -92,6 +92,9 @@ enum GLES3_RenderState {
   GLES3_RS_LIGHTING = 137,
   GLES3_RS_AMBIENT = 139,
   GLES3_RS_COLORVERTEX = 141,
+  GLES3_RS_DIFFUSEMATERIALSOURCE = 145,
+  GLES3_RS_AMBIENTMATERIALSOURCE = 147,
+  GLES3_RS_EMISSIVEMATERIALSOURCE = 148,
   GLES3_RS_NORMALIZENORMALS = 143,
   GLES3_RS_STENCILENABLE = 52,
   GLES3_RS_TEXTUREFACTOR = 60,
@@ -227,6 +230,7 @@ struct GLES3_PipelineState {
 
   // Render states
   unsigned int render_states[GLES3_RS_MAX];
+  bool vertex_has_color; // current FVF carries D3DFVF_DIFFUSE
 
   // Alpha test (emulated in fragment shader since GLES3 removed it)
   bool alpha_test_enabled;
@@ -441,6 +445,7 @@ bool GLES3_Texture_Has_Mipmaps(GLuint tex);
 // Lighting & material
 void GLES3_Set_Light(unsigned int index, const GLES3_Light* light);
 void GLES3_Enable_Light(unsigned int index, bool enable);
+void GLES3_Set_Vertex_Has_Color(bool has_color);
 void GLES3_Set_Material(const GLES3_Material* mat);
 void GLES3_Set_Fog(bool enable, float r, float g, float b,
                     float start, float end);

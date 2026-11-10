@@ -98,8 +98,10 @@ uniform bool u_FogEnabled;
 uniform float u_FogStart;
 uniform float u_FogEnd;
 
-// Color vertex mode (DX8 D3DRS_COLORVERTEX)
-uniform bool u_ColorVertex;
+// Which material colours come from the vertex colour (D3DRS_COLORVERTEX with
+// D3DRS_*MATERIALSOURCE = D3DMCS_COLOR1 and a diffuse vertex colour):
+// bit 0 ambient, bit 1 diffuse, bit 2 emissive. Otherwise the material is used.
+uniform int u_ColorVertex;
 
 // Outputs to fragment shader
 out vec4 v_Color;
@@ -159,11 +161,11 @@ void main() {
         vec3 worldNormal = normalize(worldNormalMatrix * a_Normal);
 
         // Start with emissive material color
-        vec4 totalDiffuse = u_MatEmissive;
+        vec4 totalDiffuse = (u_ColorVertex & 4) != 0 ? vertexColor : u_MatEmissive;
 
         // Global ambient contribution
-        // DX8 COLORVERTEX: when enabled, vertex color also replaces material ambient
-        vec4 matAmb = u_ColorVertex ? vertexColor : u_MatAmbient;
+        vec4 matAmb = (u_ColorVertex & 1) != 0 ? vertexColor : u_MatAmbient;
+        vec4 matDiff = (u_ColorVertex & 2) != 0 ? vertexColor : u_MatDiffuse;
         vec4 ambient = matAmb * u_GlobalAmbient;
 
         // Per-light contribution
@@ -199,13 +201,11 @@ void main() {
 
             float NdotL = max(dot(worldNormal, lightDir), 0.0);
 
-            // DX8 COLORVERTEX: when enabled, vertex color replaces material diffuse
-            vec4 matDiff = u_ColorVertex ? vertexColor : u_MatDiffuse;
             totalDiffuse += matDiff * u_Lights[i].diffuse * NdotL * attenuation;
         }
 
         v_Color = clamp(totalDiffuse + ambient, 0.0, 1.0);
-        v_Color.a = u_ColorVertex ? vertexColor.a : u_MatDiffuse.a;
+        v_Color.a = matDiff.a;
     } else {
         // No lighting — use vertex color directly (UI, 2D elements, terrain decals)
         v_Color = vertexColor;

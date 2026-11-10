@@ -643,6 +643,10 @@ void GLES3_Set_Light(unsigned int index, const GLES3_Light* light) {
     memcpy(&g_State.lights[index], light, sizeof(GLES3_Light));
 }
 
+void GLES3_Set_Vertex_Has_Color(bool has_color) {
+    g_State.vertex_has_color = has_color;
+}
+
 void GLES3_Enable_Light(unsigned int index, bool enable) {
     if (index >= 4) return;
     g_State.light_enabled[index] = enable;
@@ -1458,7 +1462,12 @@ void GLES3_ShaderManager::Apply_Uniforms(GLuint program,
     }
 
     // Color vertex mode
-    int c_vertex = state.render_states[GLES3_RS_COLORVERTEX] ? 1 : 0;
+    int c_vertex = 0;
+    if (state.render_states[GLES3_RS_COLORVERTEX] && state.vertex_has_color) {
+        if (state.render_states[GLES3_RS_AMBIENTMATERIALSOURCE] == 1) c_vertex |= 1;
+        if (state.render_states[GLES3_RS_DIFFUSEMATERIALSOURCE] == 1) c_vertex |= 2;
+        if (state.render_states[GLES3_RS_EMISSIVEMATERIALSOURCE] == 1) c_vertex |= 4;
+    }
     if (locs.u_ColorVertex != -1 && (!cache.initialized || cache.color_vertex != c_vertex)) {
         glUniform1i(locs.u_ColorVertex, c_vertex);
         cache.color_vertex = c_vertex;
