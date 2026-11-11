@@ -18,6 +18,9 @@
 #include <vector>
 #include <cstdint>
 #include <cstring>
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 // Forward declaration — defined in gles3_wrapper.cpp (which has SDL access)
 void GLES3_Swap_Buffers();
 
@@ -423,6 +426,15 @@ static inline UINT D3DFmt_BPP(D3DFORMAT fmt) {
     }
 }
 
+// Bytes to hold one w x h level. DXT data is 4x4 blocks (8 bytes DXT1, 16 DXT3/5), so a
+// level below 4x4 still needs a whole block; w*h*BPP alone is less than that for 1x1/2x1.
+static inline size_t D3DFmt_Level_Bytes(D3DFORMAT fmt, UINT w, UINT h) {
+    size_t px = (size_t)w * h * D3DFmt_BPP(fmt);
+    size_t bs = fmt == (D3DFORMAT)827611204 ? 8 : (fmt == (D3DFORMAT)861165636 || fmt == (D3DFORMAT)894720068) ? 16 : 0;
+    size_t blocks = bs * ((w + 3) / 4) * ((h + 3) / 4);
+    return px > blocks ? px : blocks;
+}
+
 // ---------------------------------------------------------------------------
 // CPU-buffer-backed surface — returned by GetSurfaceLevel / CreateImageSurface.
 // Release() deletes this object since it's always heap-allocated.
@@ -501,7 +513,7 @@ struct Emscripten_IDirect3DTexture8 : public IDirect3DTexture8 {
         UINT mw = Width, mh = Height;
         for (UINT i = 0; i < LevelCount; ++i) {
             levels[i].w = mw; levels[i].h = mh;
-            levels[i].pixels.assign((size_t)mw * mh * BPP, 0);
+            levels[i].pixels.assign(D3DFmt_Level_Bytes(Fmt, mw, mh), 0);
             if (mw > 1) mw >>= 1;
             if (mh > 1) mh >>= 1;
         }
@@ -601,15 +613,17 @@ struct Emscripten_IDirect3DTexture8 : public IDirect3DTexture8 {
     virtual DWORD GetLOD()        override { return 0; }
 
     virtual HRESULT LockRect(UINT Level, D3DLOCKED_RECT *pLockedRect,
-                             const RECT *, DWORD) override {
+                             const RECT *pRect, DWORD) override {
         if (!pLockedRect) return 0;
         if (Level >= LevelCount || levels[Level].pixels.empty()) {
             pLockedRect->pBits = nullptr;
             pLockedRect->Pitch = 0;
             return 0;
         }
-        pLockedRect->pBits  = levels[Level].pixels.data();
         pLockedRect->Pitch  = (int)(levels[Level].w * BPP);
+        // D3D points pBits at the locked rect's first pixel, not the surface's.
+        pLockedRect->pBits  = levels[Level].pixels.data() +
+            (pRect ? pRect->top * pLockedRect->Pitch + pRect->left * BPP : 0);
         return 0;
     }
 
@@ -644,7 +658,7 @@ inline Emscripten_IDirect3DSurface8::Emscripten_IDirect3DSurface8()
 inline Emscripten_IDirect3DSurface8::Emscripten_IDirect3DSurface8(UINT w, UINT h, D3DFORMAT fmt)
     : Width(w), Height(h), BytesPerPixel(D3DFmt_BPP(fmt)), Format(fmt)
 {
-    Pixels.assign((size_t)w * h * BytesPerPixel, 0);
+    Pixels.assign(D3DFmt_Level_Bytes(fmt, w, h), 0);
 }
 
 inline Emscripten_IDirect3DSurface8::~Emscripten_IDirect3DSurface8() {
@@ -663,7 +677,7 @@ inline ULONG Emscripten_IDirect3DSurface8::Release() {
     return r;
 }
 
-inline HRESULT Emscripten_IDirect3DSurface8::LockRect(D3DLOCKED_RECT *pLockedRect, const RECT *, DWORD) {
+inline HRESULT Emscripten_IDirect3DSurface8::LockRect(D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD) {
     if (pLockedRect) {
         if (ParentTexture) {
             if (ParentLevel < ParentTexture->LevelCount && !ParentTexture->levels[ParentLevel].pixels.empty()) {
@@ -680,6 +694,10 @@ inline HRESULT Emscripten_IDirect3DSurface8::LockRect(D3DLOCKED_RECT *pLockedRec
             pLockedRect->Pitch = 0;
             pLockedRect->pBits = nullptr;
         }
+        // D3D points pBits at the locked rect's first pixel, not the surface's.
+        if (pRect && pLockedRect->pBits)
+            pLockedRect->pBits = (uint8_t *)pLockedRect->pBits +
+                pRect->top * pLockedRect->Pitch + pRect->left * BytesPerPixel;
     }
     return 0;
 }
@@ -807,6 +825,10 @@ struct Emscripten_IDirect3DDevice8 : public IDirect3DDevice8 {
             pCaps->TextureOpCaps       = 0x03FFFFFF; // support all common tex ops
             pCaps->RasterCaps          = D3DPRASTERCAPS_FOGTABLE | D3DPRASTERCAPS_FOGVERTEX |
                                          D3DPRASTERCAPS_WFOG;
+            // GL has bilinear and mip filtering; without these caps TextureFilterClass
+            // maps FILTER_TYPE_BEST (the default) to POINT, e.g. a blocky shroud.
+            pCaps->TextureFilterCaps   = D3DPTFILTERCAPS_MINFLINEAR | D3DPTFILTERCAPS_MAGFLINEAR |
+                                         D3DPTFILTERCAPS_MIPFLINEAR | D3DPTFILTERCAPS_MIPFPOINT;
             pCaps->SrcBlendCaps        = 0x00003FFF;
             pCaps->DestBlendCaps       = 0x00003FFF;
             pCaps->TextureCaps         = D3DPTEXTURECAPS_PROJECTED | D3DPTEXTURECAPS_CUBEMAP;
@@ -821,7 +843,26 @@ struct Emscripten_IDirect3DDevice8 : public IDirect3DDevice8 {
         return 0;
     }
     virtual HRESULT GetDisplayMode(D3DDISPLAYMODE *pMode) override { return 0; }
-    virtual HRESULT Reset(D3DPRESENT_PARAMETERS *pParams) override { return 0; }
+    virtual HRESULT Reset(D3DPRESENT_PARAMETERS *pParams) override {
+        Size_Canvas(pParams);
+        return 0;
+    }
+    // The GL back buffer is the canvas backing store: give it the engine's
+    // resolution, and let the page letterbox it at that aspect ratio.
+    static void Size_Canvas(const D3DPRESENT_PARAMETERS *pParams) {
+#ifdef __EMSCRIPTEN__
+        if (!pParams || pParams->BackBufferWidth < 1 || pParams->BackBufferHeight < 1) return;
+        EM_ASM({
+            Module.gxCanvasW = $0;
+            Module.gxCanvasH = $1;
+            var c = document.getElementById('canvas');
+            if (!c) return;
+            c.width = $0;
+            c.height = $1;
+            c.style.aspectRatio = $0 + ' / ' + $1;
+        }, (int)pParams->BackBufferWidth, (int)pParams->BackBufferHeight);
+#endif
+    }
     virtual HRESULT Present(const RECT *pSrc, const RECT *pDst, void *hDstWnd,
                           const RGNDATA *pDirtyRgn) override {
         GLES3_Swap_Buffers();
@@ -976,7 +1017,7 @@ struct Emscripten_IDirect3DDevice8 : public IDirect3DDevice8 {
             current_fvf = Handle;
         return 0;
     }
-    virtual HRESULT SetPixelShader(DWORD Handle) override { return 0; }
+    virtual HRESULT SetPixelShader(DWORD Handle) override { GLES3_Set_Pixel_Shader(Handle); return 0; }
 
     // Helper: decode current FVF and apply vertex attrib pointers (VBO must be bound).
     //
@@ -989,13 +1030,15 @@ struct Emscripten_IDirect3DDevice8 : public IDirect3DDevice8 {
     // bytes. With this in place, the engine's indices [0,1,2,3] correctly
     // address THIS draw's vertices instead of vertices 0..3 of the shared
     // dynamic VBO (which would be whoever wrote first this frame).
-    void _setup_vertex_attribs(UINT stride_override = 0) {
+    // D3D applies BaseVertexIndex (SetIndices) to DrawIndexedPrimitive only; the
+    // non-indexed and UP draws pass use_base = false.
+    void _setup_vertex_attribs(UINT stride_override, bool use_base) {
         if (!current_fvf) return;
         GLES3_FVFDecoder dec;
         dec.Decode(current_fvf);
         UINT stride = stride_override ? stride_override : current_stride;
         if (stride == 0) stride = dec.Get_FVF_Size();
-        const UINT base_offset_bytes = (UINT)base_vtx_index * stride;
+        const UINT base_offset_bytes = use_base ? (UINT)base_vtx_index * stride : 0;
         dec.Apply_Vertex_Attribs(stride, base_offset_bytes);
     }
 
@@ -1003,7 +1046,7 @@ struct Emscripten_IDirect3DDevice8 : public IDirect3DDevice8 {
                                 UINT PrimCount) override {
         if (!current_vb || current_vb->data.empty()) return 0;
         current_vb->Upload_And_Bind();
-        _setup_vertex_attribs();
+        _setup_vertex_attribs(0, false);
         GLES3_Draw_Arrays((unsigned int)PrimType, StartVertex, PrimCount);
         return 0;
     }
@@ -1029,7 +1072,7 @@ struct Emscripten_IDirect3DDevice8 : public IDirect3DDevice8 {
         glBufferData(GL_ARRAY_BUFFER,
                      (GLsizeiptr)(vertex_count * VertexStreamZeroStride),
                      pVertexStreamZeroData, GL_DYNAMIC_DRAW);
-        _setup_vertex_attribs(VertexStreamZeroStride);
+        _setup_vertex_attribs(VertexStreamZeroStride, false);
         GLES3_Draw_Arrays((unsigned int)PrimType, 0, PrimCount);
         glDeleteBuffers(1, &tmp_vbo);
         return 0;
@@ -1048,7 +1091,7 @@ struct Emscripten_IDirect3DDevice8 : public IDirect3DDevice8 {
         if (current_ib->data.empty()) { ++gx_d3d_dip_empty_ib; return 0; }
         current_vb->Upload_And_Bind();
         current_ib->Upload_And_Bind();
-        _setup_vertex_attribs();
+        _setup_vertex_attribs(0, true);
         GLES3_Draw_Triangles((unsigned int)PrimType, StartIndex, PrimCount,
                              MinIndex, NumVertices);
         ++gx_d3d_dip_drew;
@@ -1078,7 +1121,7 @@ struct Emscripten_IDirect3DDevice8 : public IDirect3DDevice8 {
         glBufferData(GL_ARRAY_BUFFER,
                      (GLsizeiptr)(NumVertices * VertexStreamZeroStride),
                      pVertexStreamZeroData, GL_DYNAMIC_DRAW);
-        _setup_vertex_attribs(VertexStreamZeroStride);
+        _setup_vertex_attribs(VertexStreamZeroStride, false);
         // Upload indices (GLES3_Draw_Triangles expects GL_UNSIGNED_SHORT)
         UINT idx_bytes = (IndexDataFormat == D3DFMT_INDEX16) ? 2 : 4;
         GLuint tmp_ibo = 0;
@@ -1198,7 +1241,10 @@ struct Emscripten_IDirect3DDevice8 : public IDirect3DDevice8 {
                                           DWORD ConstantCount) override { return 0; }
     virtual HRESULT SetPixelShaderConstant(DWORD Register,
                                          const void *pConstantData,
-                                         DWORD ConstantCount) override { return 0; }
+                                         DWORD ConstantCount) override {
+        GLES3_Set_Pixel_Shader_Constants(Register, (const float *)pConstantData, ConstantCount);
+        return 0;
+    }
     virtual HRESULT SetClipPlane(DWORD Index, const float *pPlane) override { return 0; }
     virtual HRESULT CreateImageSurface(UINT Width, UINT Height, D3DFORMAT Format,
                                      IDirect3DSurface8 **ppSurface) override {
@@ -1215,7 +1261,13 @@ struct Emscripten_IDirect3DDevice8 : public IDirect3DDevice8 {
                                      const DWORD *pFunction, DWORD *pHandle,
                                      DWORD Usage) override { return 0; }
     virtual HRESULT DeleteVertexShader(DWORD Handle) override { return 0; }
-    virtual HRESULT CreatePixelShader(const DWORD *pFunction, DWORD *pHandle) override { return 0; }
+    // A program the emulation can't run (texbem, ...) gets no handle, so the caller's handle
+    // stays 0 and the fixed-function stages draw it, as before pixel shaders were emulated.
+    virtual HRESULT CreatePixelShader(const DWORD *pFunction, DWORD *pHandle) override {
+        unsigned int h = GLES3_Create_Pixel_Shader((const unsigned int *)pFunction);
+        if (h && pHandle) *pHandle = h;
+        return 0;
+    }
     virtual HRESULT DeletePixelShader(DWORD Handle) override { return 0; }
     virtual HRESULT ValidateDevice(DWORD *pNumPasses) override { return 0; }
     virtual HRESULT ResourceManagerDiscardBytes(DWORD Bytes) override { return 0; }
@@ -1265,6 +1317,7 @@ struct Emscripten_IDirect3D8 : public IDirect3D8 {
                                D3DPRESENT_PARAMETERS *pParams,
                                IDirect3DDevice8 **ppDevice) override { 
         *ppDevice = new Emscripten_IDirect3DDevice8();
+        Emscripten_IDirect3DDevice8::Size_Canvas(pParams);
         return 0; 
     }
     virtual HRESULT GetDeviceCaps(UINT Adapter, DWORD DeviceType,
@@ -1288,6 +1341,10 @@ struct Emscripten_IDirect3D8 : public IDirect3D8 {
             pCaps->TextureOpCaps       = 0x03FFFFFF;
             pCaps->RasterCaps          = D3DPRASTERCAPS_FOGTABLE | D3DPRASTERCAPS_FOGVERTEX |
                                          D3DPRASTERCAPS_WFOG;
+            // GL has bilinear and mip filtering; without these caps TextureFilterClass
+            // maps FILTER_TYPE_BEST (the default) to POINT, e.g. a blocky shroud.
+            pCaps->TextureFilterCaps   = D3DPTFILTERCAPS_MINFLINEAR | D3DPTFILTERCAPS_MAGFLINEAR |
+                                         D3DPTFILTERCAPS_MIPFLINEAR | D3DPTFILTERCAPS_MIPFPOINT;
             pCaps->SrcBlendCaps        = 0x00003FFF;
             pCaps->DestBlendCaps       = 0x00003FFF;
             pCaps->TextureCaps         = D3DPTEXTURECAPS_PROJECTED | D3DPTEXTURECAPS_CUBEMAP;
@@ -1348,11 +1405,75 @@ inline HRESULT D3DXCreateTextureFromFileExA(
   return 0;
 }
 
+// Pixel <-> A8R8G8B8 for the uncompressed formats surfaces use.
+static inline bool D3DX_Read_ARGB(D3DFORMAT f, const uint8_t *p, uint32_t &c) {
+  uint32_t v;
+  switch (f) {
+  case D3DFMT_A8R8G8B8: memcpy(&c, p, 4); return true;
+  case D3DFMT_X8R8G8B8: memcpy(&c, p, 4); c |= 0xff000000u; return true;
+  case D3DFMT_R8G8B8: c = 0xff000000u | (p[2] << 16) | (p[1] << 8) | p[0]; return true;
+  case D3DFMT_R5G6B5: v = p[0] | (p[1] << 8);
+    c = 0xff000000u | (((v >> 11) & 31) * 255 / 31) << 16 | (((v >> 5) & 63) * 255 / 63) << 8 | ((v & 31) * 255 / 31); return true;
+  case D3DFMT_A1R5G5B5: v = p[0] | (p[1] << 8);
+    c = ((v & 0x8000) ? 0xff000000u : 0) | (((v >> 10) & 31) * 255 / 31) << 16 | (((v >> 5) & 31) * 255 / 31) << 8 | ((v & 31) * 255 / 31); return true;
+  case D3DFMT_A4R4G4B4: v = p[0] | (p[1] << 8);
+    c = ((v >> 12) & 15) * 17u << 24 | ((v >> 8) & 15) * 17u << 16 | ((v >> 4) & 15) * 17u << 8 | (v & 15) * 17u; return true;
+  default: return false;
+  }
+}
+static inline bool D3DX_Write_ARGB(D3DFORMAT f, uint8_t *p, uint32_t c) {
+  const uint32_t a = c >> 24, r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255;
+  uint32_t v;
+  switch (f) {
+  case D3DFMT_A8R8G8B8: case D3DFMT_X8R8G8B8: memcpy(p, &c, 4); return true;
+  case D3DFMT_R8G8B8: p[0] = b; p[1] = g; p[2] = r; return true;
+  case D3DFMT_R5G6B5: v = (r >> 3) << 11 | (g >> 2) << 5 | (b >> 3); break;
+  case D3DFMT_A1R5G5B5: v = (a >= 128 ? 0x8000 : 0) | (r >> 3) << 10 | (g >> 3) << 5 | (b >> 3); break;
+  case D3DFMT_A4R4G4B4: v = (a >> 4) << 12 | (r >> 4) << 8 | (g >> 4) << 4 | (b >> 4); break;
+  default: return false;
+  }
+  p[0] = v & 255; p[1] = v >> 8;
+  return true;
+}
+
+// Copies (and point-samples, if the rects differ in size) a surface into another.
+// W3D builds textures from surfaces this way, e.g. the team-coloured copies of
+// infantry textures; a no-op left them all black.
 inline HRESULT
 D3DXLoadSurfaceFromSurface(void *pDestSurface, const void *pDestPalette,
                            const RECT *pDestRect, void *pSrcSurface,
                            const void *pSrcPalette, const RECT *pSrcRect,
                            DWORD Filter, D3DCOLOR ColorKey) {
+  auto *dst = static_cast<Emscripten_IDirect3DSurface8 *>(static_cast<IDirect3DSurface8 *>(pDestSurface));
+  auto *src = static_cast<Emscripten_IDirect3DSurface8 *>(static_cast<IDirect3DSurface8 *>(pSrcSurface));
+  if (!dst || !src) return 0;
+  const RECT sr = pSrcRect ? *pSrcRect : RECT{0, 0, (LONG)src->Width, (LONG)src->Height};
+  const RECT dr = pDestRect ? *pDestRect : RECT{0, 0, (LONG)dst->Width, (LONG)dst->Height};
+  const int sw = sr.right - sr.left, sh = sr.bottom - sr.top;
+  const int dw = dr.right - dr.left, dh = dr.bottom - dr.top;
+  if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return 0;
+  D3DLOCKED_RECT sl, dl;
+  src->LockRect(&sl, nullptr, 0);
+  dst->LockRect(&dl, nullptr, 0);
+  const uint8_t *sp = (const uint8_t *)sl.pBits;
+  uint8_t *dp = (uint8_t *)dl.pBits;
+  const UINT sb = src->BytesPerPixel, db = dst->BytesPerPixel;
+  const bool same = src->Format == dst->Format;
+  if (sp && dp) {
+    for (int y = 0; y < dh; ++y) {
+      const uint8_t *srow = sp + (size_t)(sr.top + y * sh / dh) * sl.Pitch;
+      uint8_t *drow = dp + (size_t)(dr.top + y) * dl.Pitch;
+      for (int x = 0; x < dw; ++x) {
+        const uint8_t *s = srow + (size_t)(sr.left + x * sw / dw) * sb;
+        uint8_t *d = drow + (size_t)(dr.left + x) * db;
+        uint32_t c;
+        if (same) memcpy(d, s, db);
+        else if (D3DX_Read_ARGB(src->Format, s, c)) D3DX_Write_ARGB(dst->Format, d, c);
+      }
+    }
+  }
+  src->UnlockRect();
+  dst->UnlockRect();
   return 0;
 }
 

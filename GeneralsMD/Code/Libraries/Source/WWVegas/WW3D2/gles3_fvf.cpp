@@ -20,6 +20,7 @@
 #if defined(__EMSCRIPTEN__)
 
 #include "gles3_fvf.h"
+#include "gles3_wrapper.h"
 #include <cstring>
 #include <cstdio>
 
@@ -208,6 +209,8 @@ void GLES3_FVFDecoder::Apply_Vertex_Attribs(unsigned int stride,
     // GL_UNSIGNED_BYTE with GL_TRUE normalization maps 0-255 → 0.0-1.0.
     // WebGL2 does NOT support GL_BGRA, so we pass as GL_RGBA and swizzle
     // in the vertex shader (swap .r and .b).
+    GLES3_Set_Vertex_Has_Color((fvf & D3DFVF_DIFFUSE) != 0);
+    GLES3_Set_Pretransformed((fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW);
     if (fvf & D3DFVF_DIFFUSE) {
         glEnableVertexAttribArray(ATTR_COLOR);
         glVertexAttribPointer(
@@ -222,6 +225,16 @@ void GLES3_FVFDecoder::Apply_Vertex_Attribs(unsigned int stride,
         glDisableVertexAttribArray(ATTR_COLOR);
         // Default: opaque white (matches DX8 default when no vertex color)
         glVertexAttrib4f(ATTR_COLOR, 1.0f, 1.0f, 1.0f, 1.0f);
+    }
+
+    // --- Specular color (location 11; 7-10 are the instance matrix) --- BGRA like diffuse.
+    if (fvf & D3DFVF_SPECULAR) {
+        glEnableVertexAttribArray(11);
+        glVertexAttribPointer(11, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride,
+            (const void*)(uintptr_t)(base_offset_bytes + specular_offset));
+    } else {
+        glDisableVertexAttribArray(11);
+        glVertexAttrib4f(11, 0.0f, 0.0f, 0.0f, 0.0f);
     }
 
     // --- Texture coordinates ---

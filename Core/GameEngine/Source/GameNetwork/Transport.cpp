@@ -365,7 +365,15 @@ Bool Transport::queueSend(UnsignedInt addr, UnsignedShort port, const UnsignedBy
 {
   int i;
 
-  if (len < 1 || len > MAX_PACKET_SIZE) {
+#ifdef __EMSCRIPTEN__
+  // GeneralsX @bugfix 09/11/2026 wchar_t is 4 bytes in wasm, so a LANMessage is 536 bytes and the
+  // retail 476-byte limit silently dropped every lobby message. The virtual LAN has no MTU, so
+  // allow anything doRecv can read back whole; only other web builds (same struct layout) receive it.
+  const Int maxLen = MAX_NETWORK_MESSAGE_LEN - sizeof(TransportMessageHeader);
+#else
+  const Int maxLen = MAX_PACKET_SIZE;
+#endif
+  if (len < 1 || len > maxLen) {
     DEBUG_LOG(("Transport::queueSend - Invalid Packet size"));
     return false;
   }

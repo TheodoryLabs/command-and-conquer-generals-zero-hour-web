@@ -1348,3 +1348,244 @@ binaries from backups, then made the from-source build reproducible for the firs
   `WWAudio/Threads.cpp` compiled directly into the web target (WWAudio has no CMake target yet).
 - **Verified**: clean `emcmake cmake -G Ninja` + `ninja z_generals` build boots to the animated
   main menu in a headless browser. CI now runs this exact build on every push.
+
+## 2026-11-09 — Session 15: Serverless WebRTC multiplayer on the virtual LAN
+- Set out to carry the virtual-UDP seam between machines, not just tabs, with no server.
+- Found the seam had one packet queue shared by every UDP socket, so the lobby socket (8086)
+  and the game socket (8088) could read each other's packets. `udp.cpp` now tags packets with
+  their destination port and each socket reads only its own; the queue is capped at 1024.
+- The JS side hard-coded `srcPort: 8087` and compared the broadcast address against
+  `0xFFFFFFFF` while `EM_ASM` hands it over as signed `-1`. The sender's real port now flows
+  through `onSendPacket`, and addresses are coerced to unsigned. Packets travel as one binary
+  frame (src/dest IP and port, then payload) on both transports.
+- Added `?p2p`, a WebRTC mesh. Each pair has a `lan` channel (unordered, no retransmits:
+  UDP-like) for game frames and a reliable `ctl` channel for control. Control messages reach
+  their target over a direct `ctl` or through a neighbour linked to it (ttl 3).
+  - Bootstrap: invite/reply codes (deflated JSON holding the SDP, about 1 KB) swapped by hand.
+  - Discovery: peers gossip their direct links every 5 s; a peer that learns of someone it
+    isn't linked to connects through that neighbour, so one pairing joins the whole group.
+  - Offers: the smaller id offers (manual invites excepted); offers carry a nonce, so a stale
+    answer can't land on a newer connection. ICE is not trickled; gathering gives up after 5 s.
+  - Resilience: a peer without a direct link still gets every frame, forwarded by a
+    neighbour; links the browser reports `failed` are dropped and retried through the mesh
+    (`disconnected` is left to WebRTC, which recovers it); peers silent for 60 s are forgotten.
+- Dead end: a WebSocket relay (discovery + fallback route) was built and then dropped to keep
+  the port serverless.
+- Dead end that taught the most: slow code swaps. The joiner's ICE agent starts checking the
+  host's candidates as soon as it makes its reply, and nothing answers until the host pastes
+  it: Chromium gives up after about 30 s. Stripping the host's candidates from the invite
+  fixed Chromium (with no pairs it waits, and learns the host from its incoming checks), but
+  Firefox fails an agent with no pairs after a ~5 s grace period. The fix that works in both:
+  keep one placeholder candidate on TEST-NET-1 (192.0.2.x, never routed) pending, adding a
+  fresh one every 3 s, until the link opens. Codes now stay good for 10 minutes.
+- Two adversarial reviews caught: a newcomer the larger-id peer didn't record (one-way until
+  the offer arrived); tearing links down after 10 s `disconnected`, which in a two-player game
+  left no route to re-signal; unanswered invites never closed; a stalled manual handshake
+  blocking the mesh for 10 minutes; a bad or stale pasted code breaking a live link; the
+  panel claiming "copied" when the clipboard refused. All fixed; codes are validated and
+  size-capped, and a virtual-IP clash logs a warning.
+- Built with Emscripten 6.0.2 (the CI recipe, in the `emscripten/emsdk:6.0.2` image): links,
+  no warnings from `udp.cpp`; `GX_Network_PushPacket` exports with 5 arguments. Boots to engine
+  init and stops at the first INI read without game data, as expected.
+- Verified with the shell's network block, game side stubbed:
+  - Firefox 159, Edge 157 and Chromium 152 as one serverless group (Firefox invited Edge,
+    Edge invited Chromium, Firefox–Chromium linked through the mesh); broadcasts and unicasts
+    correct; a 3-minute code swap works with either Firefox or Edge as the joiner.
+  - Chromium, three tabs: with A–C cut and blocked, frames went through B both ways;
+    unblocked, A–C relinked in 26 s; B closed, A–C kept going and B was forgotten.
+  - Node: a `disconnected` link survives the ticks and a `failed` one ends (fails on the
+    previous code).
+- A real LAN match (Steam Zero Hour data, two headless Edge players paired with `?p2p`) found
+  four existing bugs that stopped the browser LAN before any packet left, all fixed:
+  - `WSAStartup` shim returned 0 without filling `wVersion`, so `Transport::init` failed its
+    2.2 check and the lobby showed "Failed trying to communicate with the network".
+  - `wchar_t` is 4 bytes in wasm, so `LANMessage` is 536 bytes; `Transport::queueSend` dropped
+    everything over the retail 476 (the `static_assert` is compiled out for Emscripten). Web
+    builds now accept up to what `doRecv` reads back.
+  - `HEAPU8` was not exported, so the first `UDP::Write` aborted; now in
+    `EXPORTED_RUNTIME_METHODS`, and the `EM_ASM` reads `Module['HEAPU8']` (Closure-safe).
+  - The default name `VirtualMachine_a_b_c_d` is cut to 12 characters, so every player was
+    "VirtualMachi" and joins failed as duplicate names; it is now `Player<last octet>`.
+- Verified: both players listed in the LAN lobby, host created a game, the other joined and
+  accepted, the match started on Alpine Assault, each built a dozer, and both clocks passed
+  1:14 in step with no desync.
+- Saved LAN names came back as their first letter ("Player12" -> "P"): the quoted-printable
+  name codec walked bytes and stopped at the first `00 00`, which with a 4-byte `wchar_t` comes
+  right after the first char. It now walks characters and writes each as two UTF-16LE bytes,
+  the same format the Windows build writes, so existing prefs still load.
+  Names already saved by the old encoder load as one letter, so on 4-byte `wchar_t` builds a
+  one-letter saved LAN name is treated as that damage and replaced by the default (checked in the
+  browser: a planted `V_00` loads as `Player11`, a planted `Amir` still loads). The base
+  Generals copy of the codec and the same guard are fixed too.
+- Review nits fixed: auto-assigned virtual IPs are now random `10.0.x.y` (253 addresses gave an
+  8-player group about a 10% chance of a clash; now about 0.04%), and the default name is
+  unique per IP (`Player<low 16 bits>` on 10.0.x.y, `P<hex IP>` otherwise). Names with emoji
+  are saved as UTF-16 surrogate pairs, as on Windows, and joined back on 4-byte `wchar_t`.
+- Long matches: game frames are dropped when a channel's send buffer passes 256 KB, as UDP
+  would, instead of piling up seconds of stale frames behind a slow link (the game resends
+  what it needs). Node check: a backed-up channel drops, a drained one sends again.
+- 30-minute match (2 GPU-rendered headless Edge players, auto IPs 10.0.45.179 / 10.0.91.253,
+  default names Player11699 / Player23549): both ordered a unit every 2 minutes for 9 rounds and
+  every order took effect; the link stayed direct, no disconnection screen appeared, and each
+  browser's memory held at 0.7–1.0 GB with no growth.
+- Hidden tabs: browsers stop `requestAnimationFrame` in a background tab, so one player switching
+  tabs froze that engine and the lockstep match with it. In a networked game the page now ticks
+  the engine (`GX_TickHidden`) from a Web Worker timer while hidden, one tick in flight at a
+  time so slow frames can't pile up. Single player still pauses. Tested on a fresh 2-player
+  match, counting packets: player 2 sent 401 per 30 s visible and about 204 per 30 s while hidden
+  for 2 minutes, and both players carried on normally afterwards. With the ticker switched off
+  (the old behaviour) it sent almost nothing, and after 1 minute it came back to the
+  Disconnection Menu.
+- More players (GPU-rendered headless Edge on one 15 GB machine):
+  - 8 players: 7 code swaps formed a full mesh (all 28 links direct), all 8 shared one LAN
+    lobby and an 8-player game was set up; the match itself did not fit in memory (about
+    1.6 GB per copy) and the host's joins timed out while it was swapped out.
+  - 4 players: mesh, lobby, join, accept and start on Dark Night (4). Two copies then failed
+    from machine limits (one lost its WebGL context, one stalled in swap); the other two kept
+    playing in step. A leave-and-return to the lobby kept the full name.
+
+## 2026-11-10 — Session 16: In-game rendering — shroud, terrain, minimap, colours
+
+Reported in Edge (ANGLE on OpenGL, AMD RX 580, Mesa 25.2) and reproduced in headless Edge with
+`--use-angle=gl` at 1873x1035 on Alpine Assault (one-player LAN game): blocky stair-step shroud,
+black dashes across the terrain, dark stretched patches on cliffs, and a black, streaked minimap.
+Five emulation bugs, all in the DX8 → WebGL2 layer:
+
+- **No texture coordinate generation.** The shroud (and cloud shadows, the terrain noise pass,
+  projected decals) asks D3D to build texcoords from the camera-space position
+  (`D3DTSS_TCI_CAMERASPACEPOSITION`) through `D3DTS_TEXTUREn` (`D3DTTFF_COUNTn`). The shader
+  ignored `D3DTSS_TEXCOORDINDEX` and the texture matrices, so the shroud pass multiplied the
+  terrain by shroud texels picked with the terrain tiles' UVs: that was the black dashes, the dark
+  cliff patches and the shroud's shape. The vertex shader now does D3D8's per-stage texcoords
+  (UV set selection, camera-space normal / position / reflection, texture matrix, `PROJECTED`
+  divided per fragment). Stage defaults are D3D's (`TEXCOORDINDEX` = stage).
+- **Wrong `D3DTSS_*` numbers** in `emscripten_compat/d3d8types.h`: MIN/MAG filter swapped,
+  bump-env, border colour, ADDRESSW, COLORARG0/ALPHAARG0 and `TEXTURETRANSFORMFLAGS` (124
+  instead of 24) off. `DX8Wrapper::TextureStageStates[stage][32]` was indexed out of bounds with
+  124/125, and the GLES3 layer, which reads the real numbers, never saw transform flags while
+  the bump matrix landed on slot 24. All now match D3D8.
+- **No linear filtering in the caps.** `TextureFilterCaps` was 0, so `TextureFilterClass` mapped
+  `FILTER_TYPE_BEST`/`DEFAULT` to POINT: the shroud's stair steps (and point-sampled fonts).
+  The caps now report MIN/MAG linear and MIP linear/point.
+- **Minimap texture format.** The radar picks `D3DFMT_R8G8B8` first; the upload had no case for
+  it and sent the 3-byte buffer as 4-byte RGBA (`Unknown DX8 texture format 20`), hence black
+  with streaks.
+- **WebGL2 has no texture swizzle.** `GL_TEXTURE_SWIZZLE_*` fails with INVALID_ENUM (257 errors
+  per run), so every uncompressed A8R8G8B8 / X8R8G8B8 texture was sampled with red and blue
+  swapped (the menu's blue night scene and orange UI were really the sunny desert shellmap and
+  Zero Hour's blue UI), and L8 / A8 / A8L8 read the wrong channels. `To_GL_Pixels` now converts
+  channel order on the CPU for both create and update, and replaces the two copies of that code.
+- Also: `LockRect` ignored `pRect` (D3D points `pBits` at the rect's first pixel); fixed for
+  textures and surfaces, used by `SurfaceClass::Lock(min,max)` and the font column tests.
+
+Verified (same map, USA, same start, headless Edge on ANGLE-GL 1873x1035, before = deployed
+build): shroud edges and the map edge fade softly, no black dashes, cliffs show rock instead of
+dark smears, the minimap shows the terrain with its shroud, and the menu and control bar
+have their real colours. Not fixed: some terrain blend tiles (snow patches) still have hard
+cell edges; that was the same before, and it's the 2-stage terrain blend pass, a separate issue.
+
+## 2026-11-10 — Session 17: Black infantry, resolution lock, detail level
+
+Three reports from the live server: infantry render as black silhouettes, the resolution is
+stuck at the smallest mode, and higher detail levels don't take. Reproduced and verified in
+headless Edge (`--use-angle=gl`) with a LAN game on Alpine Assault (USA, Rangers from a barracks).
+
+- **Black infantry: recoloured textures were empty.** Team-coloured textures (infantry) are copies
+  made by `W3DAssetManager::Recolor_Texture_One_Time`, which builds a texture from a surface
+  through `D3DXLoadSurfaceFromSurface`. That was a `return 0` stub, so the copies stayed all
+  zero (read back from GL: RGBA 0). It now copies, point-sampling between the rects and
+  converting between the 16/24/32-bit RGB formats. `SurfaceClass::Copy` across formats and the
+  missing-texture surface used the same stub.
+- **Material colour source.** The vertex shader took ambient and diffuse from the vertex colour
+  whenever `D3DRS_COLORVERTEX` was on. D3D only does that per `D3DRS_{AMBIENT,DIFFUSE,EMISSIVE}MATERIALSOURCE`
+  = `D3DMCS_COLOR1`, and only when the vertex has a diffuse colour. Skinned meshes always carry
+  one (0 when the mesh has none) with the material as source, so they came out black even once
+  textured. The GLES3 layer now passes the three sources as a bitmask. Its render-state cache
+  must start at 0 like `DX8Wrapper::RenderStates`: the wrapper drops a "change" to a value it
+  already holds, so seeding D3D's own defaults there made them stick.
+- **Resolution.** The shim offered one mode and `web_shell.html` pinned the canvas to 800x600,
+  CSS-scaled. The device now lists the usual modes from 800x600 to 3840x2160 plus the screen's
+  size; `CreateDevice`/`Reset` size the canvas backing store to the back buffer and set its CSS
+  aspect ratio, and the page's lock follows `Module.gxCanvasW/H`. The engine re-lays out its UI
+  for the mode, mouse mapping already scales to `TheDisplay`, and the choice persists in
+  `Options.ini`.
+- **Detail level.** `CPUDetectClass::Init_Memory` only ran when CPUID exists, never on wasm, so
+  RAM read 0 MB: `GameLODManager` failed its 256 MB check, which forces low-res textures, turns
+  trees and the shell map off, and recommends Low. It now runs unconditionally (the web build
+  reports 1 GB).
+
+Verified: Rangers are textured with their team colour; vehicles keep theirs; Options lists the
+modes, 1280x720 applies at once (16:9 canvas, UI re-laid out, clicks land) and survives a
+reload; Very High sticks; the shell map now plays behind the main menu.
+
+## 2026-11-11 — Session 18: Fixes from an adversarial rendering review
+
+Three independent reviewers read the GLES3/D3D8 shim against D3D8 semantics; these are the
+must-fix findings, each checked in the code first.
+
+- **Texture stage arguments were ignored.** The fragment shader always combined arg1 = texture and
+  arg2 = current. It now reads D3DTSS_COLORARG0/1/2 and ALPHAARG0/1/2 for stages 0-1, with the
+  COMPLEMENT / ALPHAREPLICATE modifiers; a stage with no texture reads TEXTURE as white (D3D), not
+  WebGL's black; COLOROP DISABLE ends the chain. MULTIPLYADD is arg0 + arg1·arg2 and DOT3 is
+  4·dot(arg1-½, arg2-½), which keeps render2d's grayscale path identical. Stage args default to
+  D3D's (TEXTURE, CURRENT).
+- **Fog never showed.** FOGSTART/FOGEND arrive as float bits and were dropped, so start = end = 0.
+  Stored now; the fog distance is eye-space z, as D3D vertex fog without RANGEFOGENABLE.
+- **Texture uploads stole another stage's binding.** Create/Update_Texture bound to whichever unit
+  was active; they now restore that unit's texture.
+- **Non-indexed and UP draws applied BaseVertexIndex.** A leftover SetIndices base shifted the
+  shadow-darkening and occluded-player-colour quads past their 80-byte VBO. Only
+  DrawIndexedPrimitive uses the base now.
+- **XYZRHW vertices went through World·View·Projection.** They are screen pixels with 1/w; the
+  vertex shader maps them straight to clip space (D3D pixel centres at +0.5) and skips lighting and fog.
+- **Stencil.** Only STENCILENABLE reached GL. Func/ref/mask/ops/write mask are forwarded, and the
+  canvas now asks for an 8-bit stencil buffer (EmscriptenMain.cpp): it had none, so once the quads
+  above drew, the player-colour quad tinted the whole view red. Clear ignores the write masks, as
+  D3D's Clear does.
+- **Point lights** now stop at Range and add their Ambient (D3D: global + Σ attenuated light ambient).
+- **Render-state cache.** Session 17 said this cache "must start at 0 like DX8Wrapper::RenderStates";
+  that was wrong: the engine's cache starts at 0x12345678 (Invalidate_Cached_Render_States). The
+  redundant-state skip here dropped the engine's first "set to 0" (TEXTUREFACTOR stayed white,
+  AMBIENT stayed 0.2). The skip is gone; the engine already filters repeats.
+
+Verified: same LAN game on Alpine Assault in headless Edge (ANGLE-GL) renders the same as the
+deployed build (only the flashing general's button differs), 8 stencil bits, no WebGL errors.
+Not exercised by that scene: fog, stencil shadows, point lights. Still open (should-fix): stages
+2-3 always modulate, missing ADDSMOOTH/SUBTRACT/specular, SetRenderTarget no-op, authored mips
+replaced by glGenerateMipmap, small DXT mips under-allocated, no S3TC fallback.
+
+## 2026-11-11 — Session 19: Pixel shaders, four texture stages, specular, small DXT levels
+
+The should-fix items from the Session 18 review, starting with the terrain blend edges.
+
+- **Terrain blends (hard snow edges) — root cause: no pixel shader ever ran.** The web build reports
+  PS 1.1, so the game picks TerrainShaderPixelShader (terrain.pso: `lrp r0, v0.a, t1, t0` then
+  `mul r0, r0, v0`) and the flat/road variants. Two things stopped it: LoadAndCreateD3DShader sized
+  its buffer with getFileInfo, which returns 0 for these backslash archive paths here, so the
+  shader tokens were never read; and the shim's CreatePixelShader/SetPixelShader were stubs. The
+  terrain then drew with whatever stage states were left over: dark, unlit by the vertex colour,
+  and with no blend between the base and blend tile. Fixed: the loader asks the open file for its
+  size; CreatePixelShader parses ps.1.1 tokens (tex, mov, add, sub, mul, mad, dp3, dp4, lrp; write
+  masks, _x2/_x4/_d2, _sat; .a/.b replicate; neg/bias/sign/comp/x2 source modifiers) into a small
+  program the fragment shader interprets, with c0-c7 from SetPixelShaderConstant. A program with
+  anything else (texbem: wave, motion blur) gets no handle, so its caller keeps the fixed-function
+  path as before. Trees still use the fixed-function path (their vertex shader is not emulated, so
+  the game never selects the pixel shader for them). Water's runtime-assembled shaders are untouched
+  (D3DXAssembleShader still fails).
+- **Texture stages 0-3** now all run D3D's op chain with their own COLORARG0/1/2 and ALPHAARG0/1/2,
+  stop at the first DISABLE, and saturate every stage (MODULATE2X no longer feeds >1 onward). Added
+  SUBTRACT, ADDSMOOTH, BLENDDIFFUSEALPHA, BLENDFACTORALPHA, BLENDTEXTUREALPHAPM,
+  MODULATECOLOR_ADDALPHA, MODULATEINV*, LERP, and the same ops on the alpha side. BLENDTEXTUREALPHA
+  and BLENDCURRENTALPHA now use the texture's and current alpha (they used arg1.a/arg2.a).
+  Stage ops are seeded with D3D's defaults (stage 0 MODULATE/SELECTARG1, others DISABLE).
+- **Specular.** Vertex specular colour (FVF SPECULAR, attribute 11) is passed through when lighting
+  is off; with lighting on, Blinn-Phong per light (local viewer, material power and specular, light
+  specular). D3DRS_SPECULARENABLE adds it after the stages; D3DTA_SPECULAR reads it.
+- **DXT levels below 4x4** were allocated w*h*BPP bytes, less than one 8/16-byte block; they get
+  whole blocks now (texture levels and standalone surfaces).
+
+Verified in headless Edge (same LAN game, Alpine Assault): snow and grass patches blend softly, the
+terrain is lit by the vertex colour (it was much darker), no WebGL errors. Not exercised: specular
+(nothing in that scene enables it), the monochrome filter, fog, stencil shadows, point lights.
+Still open: SetRenderTarget no-op, authored mips replaced by glGenerateMipmap, no S3TC fallback,
+a texture changed while bound is not re-uploaded, COLORWRITEENABLE ignored.

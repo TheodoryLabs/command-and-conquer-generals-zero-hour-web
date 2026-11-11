@@ -112,6 +112,51 @@ The game will:
 
 ---
 
+## Multiplayer (virtual LAN, experimental)
+
+The browser has no raw UDP, so the game's LAN traffic travels over a virtual LAN. Once players
+are connected they see each other under **Network → LAN**.
+
+| Link ends with | How players connect |
+|---|---|
+| `?p2p` | Browser-to-browser over WebRTC, between any machines; players swap invite codes. No server. |
+| `?virtual_net` | Tabs on one machine (`BroadcastChannel`) |
+
+Everyone in a game must use the same row.
+
+### Playing over WebRTC (`?p2p`)
+
+A **P2P** panel appears in the top-right corner. Pair in the lobby: the code boxes pause the
+game while they're open.
+
+1. Any player in the game presses **Invite** and sends the code to the player joining, by
+   any chat app.
+2. The joining player presses **Join**, pastes the code, and sends back the reply code.
+3. The inviting player presses **Accept reply** and pastes it. There's no rush: a code stays
+   good for 10 minutes.
+
+The new player only has to pair with **one** member: that member introduces them to everyone
+else over WebRTC, and the whole group links up within about 10–20 seconds. The panel shows
+`P2P: direct / players`.
+
+- **Short network blips** are left to WebRTC, which recovers the link by itself.
+- **If the browser gives a link up** (WebRTC reports it failed), the two players' traffic is
+  forwarded through a player who can still reach both, and the direct link is retried
+  through the others.
+- **If a player leaves**, the rest keep playing; the leaver is forgotten after a minute.
+- **A two-player game has nobody to forward through**: if its only link fails, swap codes again.
+
+WebRTC asks Google's public STUN server for each player's public address; that is not a
+server you run. Players on the same local network can pass `&stun=none`, though some routers
+block the local discovery that then relies on; `&stun=stun:host:port` picks another server.
+A few strict networks (some mobile carriers, corporate firewalls) block direct WebRTC: such a
+player can still play as long as at least one other player can reach them.
+
+Each player gets a random `10.0.x.y` address, so a clash is very unlikely; if the console
+warns of one, reload with `&ip=10.0.X.Y` using any numbers nobody else has.
+
+---
+
 ## Troubleshooting
 
 ### Black screen / nothing loads

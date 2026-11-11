@@ -102,14 +102,14 @@ if(EMSCRIPTEN)
             "-sMALLOC=emmalloc"
             # Closure's ADVANCED_OPTIMIZATIONS needs the legacy allocator
             # helpers declared (SDL2's SDL_assert.c EM_ASM references them).
-            "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS','printErr','addFunction','noExitRuntime','UTF8ToString','allocate','ALLOC_NORMAL','intArrayFromString']"
+            "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS','printErr','addFunction','noExitRuntime','UTF8ToString','HEAPU8','allocate','ALLOC_NORMAL','intArrayFromString']"
         )
     else()
         set(GX_PROFILE_FLAGS
             "-O0"
             "-g3"
             "-sASSERTIONS=2"
-            "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS','printErr','addFunction','noExitRuntime','UTF8ToString']"
+            "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS','printErr','addFunction','noExitRuntime','UTF8ToString','HEAPU8']"
         )
     endif()
 
@@ -145,7 +145,7 @@ if(EMSCRIPTEN)
         # repeated -s flags override, so it must appear exactly once.)
         # JS-callable C entry points. EMSCRIPTEN_KEEPALIVE attributes alone
         # *should* be enough, but listing them explicitly is defensive.
-        "-sEXPORTED_FUNCTIONS=['_main','_EmscriptenInput_OnPointerLockChange','_EmscriptenInput_GetVirtualMouseX','_EmscriptenInput_GetVirtualMouseY','_GX_FlushIdbfs_Tab','_GX_OnCanvasResize','_AIL_trigger_sample_eos','_GX_Network_EnableVirtual','_GX_Network_PushPacket','_GX_Network_SetVirtualIP','_malloc','_free']"
+        "-sEXPORTED_FUNCTIONS=['_main','_EmscriptenInput_OnPointerLockChange','_EmscriptenInput_GetVirtualMouseX','_EmscriptenInput_GetVirtualMouseY','_GX_FlushIdbfs_Tab','_GX_OnCanvasResize','_AIL_trigger_sample_eos','_GX_Network_EnableVirtual','_GX_Network_PushPacket','_GX_Network_SetVirtualIP','_GX_TickHidden','_malloc','_free']"
         "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=['$registerPointerlockErrorEventCallback']"
     )
 

@@ -1147,9 +1147,11 @@ public:
 			CPUDetectClass::Init_Processor_Family();
 			CPUDetectClass::Init_Processor_String();
 			CPUDetectClass::Init_Processor_Features();
-			CPUDetectClass::Init_Memory();
 			CPUDetectClass::Init_OS();
 		}
+		// Not CPUID-specific: wasm has no CPUID, and 0 MB of RAM made GameLOD force
+		// low-res textures, no trees and the Low preset.
+		CPUDetectClass::Init_Memory();
 		CPUDetectClass::Init_Processor_Speed();
 
 		CPUDetectClass::Init_Processor_Log();

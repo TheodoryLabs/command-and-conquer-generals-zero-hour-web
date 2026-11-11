@@ -471,7 +471,8 @@
 
         // Virtual UDP BroadcastChannel networking routing
         const urlParams = new URLSearchParams(window.location.search);
-        const virtualNetEnabled = urlParams.has('virtual_net') || urlParams.has('ip') || urlParams.has('virtual_ip');
+        const p2pEnabled = urlParams.has('p2p');
+        const virtualNetEnabled = urlParams.has('virtual_net') || urlParams.has('ip') || urlParams.has('virtual_ip') || p2pEnabled;
         
         let virtualIP = [127, 0, 0, 1];
         if (virtualNetEnabled) {
@@ -479,9 +480,9 @@
           if (ipParam && /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ipParam)) {
             virtualIP = ipParam.split('.').map(Number);
           } else {
-            // Auto-assign random IP on 10.0.0.X (between 2 and 254)
-            const randomOctet = Math.floor(Math.random() * 253) + 2;
-            virtualIP = [10, 0, 0, randomOctet];
+            // Auto-assign a random 10.0.X.Y. 253 addresses gave an 8-player group about a 10%
+            // chance of two players sharing one; ~65k makes it about 0.04%.
+            virtualIP = [10, 0, Math.floor(Math.random() * 256), Math.floor(Math.random() * 253) + 2];
           }
           console.log(`[GeneralsX] Virtual Networking enabled. Assigned Virtual IP: ${virtualIP.join('.')}`);
         }
@@ -491,25 +492,358 @@
         };
         const virtualIPInt = ipToUint32(virtualIP);
 
-        const bc = new BroadcastChannel('generalsx-virtual-lan');
-        bc.onmessage = function (e) {
-          if (!virtualNetEnabled) return;
-          if (e.data && e.data.type === 'udp_packet') {
-            const packet = e.data;
-            const isBroadcast = packet.destIP === 0xFFFFFFFF;
-            const isForUs = isBroadcast || (packet.destIP === virtualIPInt);
-            if (isForUs && packet.srcIP !== virtualIPInt) {
-              if (window.Module && typeof window.Module._GX_Network_PushPacket === 'function') {
-                const payload = packet.payload;
-                const len = payload.length;
-                const ptr = window.Module._malloc(len);
-                window.Module.HEAPU8.set(payload, ptr);
-                window.Module._GX_Network_PushPacket(ptr, len, packet.srcIP, packet.srcPort);
-                window.Module._free(ptr);
-              }
-            }
-          }
+        // GeneralsX @feature 09/11/2026 Virtual LAN transport. Packets travel as one binary frame:
+        // srcIP u32, destIP u32, srcPort u16, destPort u16 (big-endian), then the payload.
+        // Default is BroadcastChannel (tabs on one machine). ?p2p sends them browser-to-browser
+        // over WebRTC between machines, with no server: players swap invite codes.
+        const encodePacket = (srcIP, destIP, srcPort, destPort, payload) => {
+          const frame = new Uint8Array(12 + payload.length);
+          const view = new DataView(frame.buffer);
+          view.setUint32(0, srcIP); view.setUint32(4, destIP);
+          view.setUint16(8, srcPort); view.setUint16(10, destPort);
+          frame.set(payload, 12);
+          return frame;
         };
+
+        const deliverPacket = (frame) => {
+          if (!virtualNetEnabled || frame.length < 12) return;
+          const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
+          const srcIP = view.getUint32(0), destIP = view.getUint32(4);
+          const srcPort = view.getUint16(8), destPort = view.getUint16(10);
+          const isForUs = destIP === 0xFFFFFFFF || destIP === virtualIPInt;
+          if (srcIP === virtualIPInt && !deliverPacket.clashWarned) { // no transport echoes our own frames
+            deliverPacket.clashWarned = true;
+            console.warn(`[GeneralsX] Another player has virtual IP ${virtualIP.join('.')}; one of you should reload with &ip=10.0.X.Y (any free numbers)`);
+          }
+          if (!isForUs || srcIP === virtualIPInt) return;
+          // Frames from players already in the lobby can arrive while this page is still loading
+          // the game; drop them (like UDP) until the runtime is up, or _malloc aborts the page.
+          if (!window.Module || !window.Module.gxNetReady) return;
+          const payload = frame.subarray(12);
+          const ptr = window.Module._malloc(payload.length);
+          window.Module.HEAPU8.set(payload, ptr);
+          window.Module._GX_Network_PushPacket(ptr, payload.length, srcIP, srcPort, destPort);
+          window.Module._free(ptr);
+        };
+
+        // WebRTC mesh, no server. Each peer pair has two data channels: 'lan' (unordered, no
+        // retransmits: UDP-like) for game frames and 'ctl' (reliable) for control. Control
+        // messages {type, from, to} reach their target over a direct 'ctl', or through a
+        // neighbour whose links include the target.
+        //  - Bootstrap: invite/reply codes swapped by hand (any chat app).
+        //  - Discovery: peers gossip their direct links every 5 s; whoever learns of a peer it
+        //    isn't linked to connects through that neighbour, so one pairing joins the whole mesh.
+        //  - Offers: the smaller id always offers (manual invites excepted), so offers never cross.
+        //  - Resilience: frames for a peer without a direct link are forwarded by a neighbour that
+        //    has one; dead links are torn down and retried through the mesh; silent peers expire.
+        const startPeerMesh = () => {
+          const myId = Math.random().toString(36).slice(2, 10);
+          const stun = urlParams.get('stun');
+          const iceServers = stun === 'none' ? [] : [{ urls: stun || 'stun:stun.l.google.com:19302' }];
+          const peers = new Map(); // id -> { pc, lan, ctl, links, heard, deadline, n }
+          const invites = new Map(); // nonce -> peer object, until its reply code is accepted
+          const isOpen = (ch) => !!ch && ch.readyState === 'open';
+          const nonce = () => Math.random().toString(36).slice(2, 10);
+          const warn = (err) => console.warn('[GeneralsX] P2P:', err);
+          const blank = () => ({ pc: null, lan: null, ctl: null, links: new Set(), heard: Date.now(), deadline: 0, n: null });
+          const getPeer = (id) => { if (!peers.has(id)) peers.set(id, blank()); return peers.get(id); };
+          const direct = () => [...peers].filter(([, p]) => isOpen(p.ctl)).map(([id]) => id);
+          // Game frames over a backed-up channel are dropped, as UDP would, instead of queueing:
+          // a slow link otherwise piles up seconds of stale frames (up to the browser's ~16 MB
+          // send buffer) and the lockstep game stalls on them. The game resends what it needs.
+          // ponytail: fixed 256 KB cap; tune per link if real networks need it.
+          const backlogged = (ch) => ch.bufferedAmount > 256 * 1024;
+
+          const route = (msg) => {
+            const json = JSON.stringify(msg);
+            const send = (ch) => { if (msg.type !== 'pkt' || !backlogged(ch)) ch.send(json); };
+            try {
+              const p = peers.get(msg.to);
+              if (p && isOpen(p.ctl)) return send(p.ctl);
+              for (const n of peers.values()) {
+                if (isOpen(n.ctl) && n.links.has(msg.to)) return send(n.ctl);
+              }
+              // otherwise unreachable for now: dropped, like UDP; the next tick retries the link
+            } catch (err) { /* channel closing or its buffer full: dropped, like UDP */ }
+          };
+          const signal = (msg) => route(Object.assign({ from: myId, ttl: 3 }, msg));
+          const sendLinks = () => {
+            const msg = JSON.stringify({ type: 'links', from: myId, ids: direct() });
+            peers.forEach((p) => { if (isOpen(p.ctl)) p.ctl.send(msg); });
+          };
+
+          const drop = (p) => {
+            if (p.pc) p.pc.close();
+            p.pc = p.lan = p.ctl = null;
+            updateStatus();
+          };
+          const attach = (p, pc, ch) => {
+            if (p.pc !== pc) return; // channel from a connection we already replaced
+            ch.binaryType = 'arraybuffer';
+            if (ch.label === 'lan') {
+              p.lan = ch;
+              ch.onmessage = (e) => { p.heard = Date.now(); deliverPacket(new Uint8Array(e.data)); };
+              return;
+            }
+            p.ctl = ch;
+            const opened = () => { console.log('[GeneralsX] P2P link open'); updateStatus(); sendLinks(); };
+            ch.onopen = opened;
+            ch.onclose = updateStatus;
+            ch.onmessage = (e) => { p.heard = Date.now(); onControl(e.data); };
+            if (ch.readyState === 'open') opened();
+          };
+          const openPc = (p, offerer) => {
+            drop(p);
+            const pc = new RTCPeerConnection({ iceServers: iceServers });
+            p.pc = pc;
+            p.deadline = Date.now() + 20000; // a handshake that hasn't opened by then is retried
+            pc.ondatachannel = (e) => attach(p, pc, e.channel);
+            // 'disconnected' is left alone: WebRTC recovers from it by itself, and closing the
+            // link ourselves could strand a pair with no other route to re-signal through.
+            // Only the browser's own verdict, 'failed', ends a link.
+            pc.onconnectionstatechange = () => {
+              if (p.pc === pc && pc.connectionState === 'failed') drop(p);
+            };
+            if (offerer) {
+              attach(p, pc, pc.createDataChannel('lan', { ordered: false, maxRetransmits: 0 }));
+              attach(p, pc, pc.createDataChannel('ctl'));
+            }
+            return pc;
+          };
+          // Gathering can stall (STUN blocked); after 5 s use whatever candidates exist.
+          const gathered = (pc) => new Promise((resolve) => {
+            if (pc.iceGatheringState === 'complete') return resolve();
+            setTimeout(resolve, 5000);
+            pc.addEventListener('icegatheringstatechange', () => {
+              if (pc.iceGatheringState === 'complete') resolve();
+            });
+          });
+          const makeOffer = async (p) => {
+            const pc = openPc(p, true);
+            p.n = nonce();
+            await pc.setLocalDescription(await pc.createOffer());
+            await gathered(pc);
+            return pc;
+          };
+          const makeAnswer = async (p, sdp) => {
+            const pc = openPc(p, false);
+            await pc.setRemoteDescription({ type: 'offer', sdp: sdp });
+            await pc.setLocalDescription(await pc.createAnswer());
+            await gathered(pc);
+            return pc;
+          };
+          const takeAnswer = async (p, n, sdp) => {
+            if (p.pc && p.n === n && p.pc.signalingState === 'have-local-offer') {
+              p.deadline = Date.now() + 20000; // invites wait for a human; the clock starts now
+              await p.pc.setRemoteDescription({ type: 'answer', sdp: sdp });
+            }
+          };
+
+          const connect = async (id) => {
+            const p = getPeer(id);
+            const pc = await makeOffer(p);
+            if (p.pc === pc) signal({ type: 'offer', to: id, n: p.n, sdp: pc.localDescription.sdp });
+          };
+          // Heard of a peer we have no connection to: the smaller id offers, the larger says hello.
+          const learn = (id, sayHello) => {
+            if (!id || id === myId) return;
+            const p = getPeer(id);
+            if (p.pc) return;
+            if (myId < id) connect(id).catch(warn);
+            else if (sayHello) signal({ type: 'hello', to: id });
+          };
+
+          const onControl = async (raw) => {
+            let msg;
+            try { msg = JSON.parse(raw); } catch (err) { return; }
+            if (msg.to !== undefined && msg.to !== myId) { // not ours: pass it one hop on
+              if (--msg.ttl > 0) route(msg);
+              return;
+            }
+            if (!msg.from || msg.from === myId) return;
+            const p = getPeer(msg.from);
+            p.heard = Date.now();
+            // Heard by another route while our link to them isn't open (e.g. a manual pairing
+            // the host never finished): give that handshake 20 s, then the mesh takes over.
+            if (p.pc && !isOpen(p.ctl)) p.deadline = Math.min(p.deadline, p.heard + 20000);
+            try {
+              if (msg.type === 'hello') {
+                learn(msg.from, msg.to === undefined); // answer a broadcast hello so they know us
+              } else if (msg.type === 'links') {
+                p.links = new Set(msg.ids);
+                msg.ids.forEach((id) => learn(id, true));
+              } else if (msg.type === 'offer') {
+                const pc = await makeAnswer(p, msg.sdp);
+                if (p.pc === pc) signal({ type: 'answer', to: msg.from, n: msg.n, sdp: pc.localDescription.sdp });
+              } else if (msg.type === 'answer') {
+                await takeAnswer(p, msg.n, msg.sdp);
+              } else if (msg.type === 'pkt') {
+                deliverPacket(Uint8Array.from(atob(msg.data), (c) => c.charCodeAt(0)));
+              }
+            } catch (err) {
+              warn(err);
+            }
+          };
+
+          setInterval(() => {
+            const now = Date.now();
+            peers.forEach((p, id) => {
+              if (p.pc) {
+                if (!isOpen(p.ctl) && now > p.deadline) drop(p); // never opened, or closed by them
+              } else if (now - p.heard > 60000) {
+                peers.delete(id); // gone: nothing heard from them for a minute
+              } else {
+                learn(id, true); // still around but not linked: try again
+              }
+            });
+            invites.forEach((p, n) => {
+              if (now > p.deadline) { drop(p); invites.delete(n); } // unanswered invite
+            });
+            sendLinks();
+            updateStatus();
+          }, 5000);
+
+          // Invite codes: deflated JSON, base64url. They hold an SDP, so they're about 1 KB.
+          const pack = async (obj) => {
+            const stream = new Blob([JSON.stringify(obj)]).stream().pipeThrough(new CompressionStream('deflate-raw'));
+            const bytes = new Uint8Array(await new Response(stream).arrayBuffer());
+            return 'GX1.' + btoa(String.fromCharCode.apply(null, bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+          };
+          const unpack = async (code) => {
+            if (typeof code !== 'string' || code.length > 16384) throw new Error('not a code from this game');
+            const b64 = code.trim().replace(/^GX1\./, '').replace(/-/g, '+').replace(/_/g, '/');
+            const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+            const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+            const text = await new Response(stream).text();
+            if (text.length > 65536) throw new Error('not a code from this game');
+            return JSON.parse(text);
+          };
+          const isCode = (o, kind) => !!o && o.kind === kind && typeof o.from === 'string' && o.from !== '' &&
+            o.from !== myId && typeof o.n === 'string' && typeof o.sdp === 'string';
+
+          p2pApi = {
+            id: myId,
+            // Host: make a code for one joining player.
+            invite: async () => {
+              const p = blank();
+              const pc = await makeOffer(p);
+              p.deadline = Date.now() + 600000; // the joiner has 10 minutes to send a reply
+              invites.set(p.n, p);
+              return pack({ kind: 'offer', from: myId, n: p.n, sdp: pc.localDescription.sdp });
+            },
+            // Joiner: paste the host's code, get a reply code to send back.
+            join: async (code) => {
+              const o = await unpack(code);
+              if (!isCode(o, 'offer')) throw new Error('not an invite code');
+              if (peers.has(o.from) && isOpen(peers.get(o.from).ctl)) throw new Error('already connected to that player');
+              const p = getPeer(o.from);
+              p.heard = Date.now();
+              // Leave the host's candidates out: with none, our ICE agent has nothing to check and
+              // can't time out while the host takes its time pasting the reply. Once the host
+              // applies it, the host's checks reach us and we learn its address from them.
+              const noCandidates = o.sdp.split('\r\n').filter((l) => !/^a=(candidate|end-of-candidates)/.test(l)).join('\r\n');
+              const pc = await makeAnswer(p, noCandidates);
+              p.deadline = Date.now() + 600000; // the host has 10 minutes to paste the reply
+              // Firefox fails an ICE agent that has no candidate pair for a few seconds. Until the
+              // link opens, keep one pending with a placeholder on TEST-NET-1 (RFC 5737: never
+              // routed, so the check just times out) and add a fresh one every 3 s.
+              let placeholder = 0;
+              const hold = () => {
+                if (p.pc !== pc || isOpen(p.ctl) || Date.now() > p.deadline) return clearInterval(holdTimer);
+                const ip = '192.0.2.' + (1 + (placeholder++ % 254));
+                pc.addIceCandidate({ candidate: `candidate:${placeholder} 1 udp 1 ${ip} 9 typ host`, sdpMLineIndex: 0 }).catch(() => {});
+              };
+              const holdTimer = setInterval(hold, 3000);
+              hold();
+              return pack({ kind: 'answer', from: myId, n: o.n, sdp: pc.localDescription.sdp });
+            },
+            // Host: paste the joiner's reply code.
+            accept: async (code) => {
+              const a = await unpack(code);
+              const p = isCode(a, 'answer') && invites.get(a.n);
+              if (!p) throw new Error('not a reply to an invite from this tab');
+              invites.delete(a.n);
+              const old = peers.get(a.from);
+              if (old && isOpen(old.ctl)) { drop(p); throw new Error('already connected to that player'); }
+              if (old) drop(old);
+              p.heard = Date.now();
+              peers.set(a.from, p);
+              await takeAnswer(p, a.n, a.sdp);
+            },
+            peers: () => [...peers].map(([id, p]) => ({ id: id, direct: isOpen(p.ctl), state: p.pc ? p.pc.connectionState : 'none' })),
+            // Drop the direct link to one peer. It relinks only through a third player; with
+            // nobody else in the game, swap codes again.
+            disconnect: (id) => { if (peers.has(id)) drop(peers.get(id)); },
+          };
+
+          // Every peer gets every frame (the receiver filters by IP, as on a real LAN).
+          return (frame) => {
+            let b64 = null;
+            peers.forEach((p, id) => {
+              if (isOpen(p.lan)) {
+                if (backlogged(p.lan)) return;
+                try { p.lan.send(frame); } catch (err) { /* buffer full: dropped, like UDP */ }
+              } else {
+                b64 = b64 || btoa(String.fromCharCode.apply(null, frame));
+                signal({ type: 'pkt', to: id, data: b64 }); // forwarded by a neighbour
+              }
+            });
+          };
+        };
+
+        // Small panel for invite/reply codes. ponytail: prompt() pauses the game while open, so pair in the lobby.
+        let p2pApi = null;
+        const statusEl = document.createElement('div');
+        const updateStatus = () => {
+          if (!p2pApi) return;
+          const list = p2pApi.peers();
+          statusEl.textContent = `P2P: ${list.filter((p) => p.direct).length} direct / ${list.length} players`;
+        };
+        const showP2pPanel = () => {
+          const panel = document.createElement('div');
+          panel.id = 'gx-p2p';
+          panel.style.cssText = 'position:fixed;top:8px;right:8px;z-index:1000;display:flex;gap:6px;align-items:center;' +
+            'font:12px system-ui,sans-serif;color:#fff;background:rgba(0,0,0,.65);padding:6px 8px;border-radius:6px';
+          const button = (label, action) => {
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.textContent = label;
+            b.onclick = () => action().catch((err) => alert('P2P: ' + err.message));
+            panel.appendChild(b);
+          };
+          // Clipboard needs a secure context (https or localhost) and, in Firefox/Safari, a fresh
+          // click; after the await it may refuse, so say which happened.
+          const copy = async (code) => {
+            try { await navigator.clipboard.writeText(code); return '(copied)'; } catch (err) { return '(select it and copy it)'; }
+          };
+          button('Invite', async () => {
+            const code = await p2pApi.invite();
+            prompt(`Invite code ${await copy(code)}. Send it to the player joining, then press "Accept reply" with their answer.`, code);
+          });
+          button('Join', async () => {
+            const code = prompt('Paste the invite code:');
+            if (!code) return;
+            const reply = await p2pApi.join(code);
+            prompt(`Reply code ${await copy(reply)}. Send it back to the player who invited you.`, reply);
+          });
+          button('Accept reply', async () => {
+            const code = prompt('Paste the reply code:');
+            if (code) await p2pApi.accept(code);
+          });
+          panel.appendChild(statusEl);
+          document.body.appendChild(panel);
+          updateStatus();
+        };
+
+        let sendFrame;
+        if (p2pEnabled) {
+          sendFrame = startPeerMesh();
+          if (document.body) showP2pPanel(); else document.addEventListener('DOMContentLoaded', showP2pPanel);
+        } else {
+          const bc = new BroadcastChannel('generalsx-virtual-lan');
+          bc.onmessage = (e) => { if (e.data instanceof Uint8Array) deliverPacket(e.data); };
+          sendFrame = (frame) => bc.postMessage(frame);
+        }
 
         // Stage display names. The C++ side uses the keys; the UI uses the values.
         const STAGE_LABELS = {
@@ -637,16 +971,9 @@
         window.GeneralsX = {
           virtualIP: virtualIP,
           virtualNetEnabled: virtualNetEnabled,
-          onSendPacket: function (data, destIP, destPort) {
+          onSendPacket: function (data, destIP, destPort, srcPort) {
             if (!virtualNetEnabled) return;
-            bc.postMessage({
-              type: 'udp_packet',
-              srcIP: virtualIPInt,
-              srcPort: 8087,
-              destIP: destIP,
-              destPort: destPort,
-              payload: data
-            });
+            sendFrame(encodePacket(virtualIPInt, destIP >>> 0, srcPort, destPort, data));
           },
 
           setProgress: function (stage, current, total, label) {
@@ -799,8 +1126,11 @@
         const gxLockCanvasBacking = function () {
           const canvasEl = document.getElementById('canvas');
           if (!canvasEl) return;
-          if (canvasEl.width !== GX_FIXED_W) canvasEl.width = GX_FIXED_W;
-          if (canvasEl.height !== GX_FIXED_H) canvasEl.height = GX_FIXED_H;
+          // The engine sizes the canvas to its display mode (d3d8.h Size_Canvas).
+          const M = window.Module || {};
+          const w = M.gxCanvasW || GX_FIXED_W, h = M.gxCanvasH || GX_FIXED_H;
+          if (canvasEl.width !== w) canvasEl.width = w;
+          if (canvasEl.height !== h) canvasEl.height = h;
         };
         gxLockCanvasBacking();
         // Re-pin on any resize-like event Emscripten may trigger.
@@ -1102,12 +1432,36 @@
           });
         };
 
+        // A hidden tab gets no requestAnimationFrame, so in a LAN game one player switching tabs
+        // would stall everyone. While hidden, tick the engine from a Web Worker timer, which
+        // browsers don't throttle. Single player keeps pausing in the background.
+        if (virtualNetEnabled) {
+          let ticker = null;
+          document.addEventListener('visibilitychange', () => {
+            if (document.hidden && !ticker) {
+              // One tick in flight: the worker waits for the page's reply before the next, so a
+              // frame slower than 33 ms can't pile ticks up in the page's task queue.
+              ticker = new Worker(URL.createObjectURL(new Blob([
+                'let busy = false; onmessage = () => { busy = false; };' +
+                'setInterval(() => { if (!busy) { busy = true; postMessage(0); } }, 33);'])));
+              ticker.onmessage = () => {
+                if (document.hidden && typeof window.Module._GX_TickHidden === 'function') window.Module._GX_TickHidden();
+                if (ticker) ticker.postMessage(0);
+              };
+            } else if (!document.hidden && ticker) {
+              ticker.terminate();
+              ticker = null;
+            }
+          });
+        }
+
         window.Module = {
           canvas: document.getElementById('canvas'),
           print: printToOutput,
           printErr: printErrToOutput,
           preRun: [idbfsPreRun],
           onRuntimeInitialized: function () {
+            window.Module.gxNetReady = true;
             if (virtualNetEnabled) {
               console.log(`[GeneralsX] Enabling virtual networking with IP: ${virtualIP.join('.')}`);
               if (typeof window.Module._GX_Network_EnableVirtual === 'function') {

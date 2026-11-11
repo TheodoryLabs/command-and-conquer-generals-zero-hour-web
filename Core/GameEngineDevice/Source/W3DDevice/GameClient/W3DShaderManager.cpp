@@ -3014,9 +3014,14 @@ HRESULT W3DShaderManager::LoadAndCreateD3DShader(const char* strFilePath, const 
 			return E_FAIL;
 		}
 
-		FileInfo fileInfo;
-		TheFileSystem->getFileInfo(AsciiString(strFilePath), &fileInfo);
-		DWORD dwFileSize = fileInfo.sizeLow;
+		// Ask the open file for its size: getFileInfo misses these backslash archive paths on
+		// the web build, which left the size 0 and the shader tokens unread.
+		DWORD dwFileSize = file->size();
+		if (dwFileSize < 8)
+		{
+			file->close();
+			return E_FAIL;
+		}
 
 		const DWORD* pShader = (DWORD*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, dwFileSize);
 		if (!pShader)

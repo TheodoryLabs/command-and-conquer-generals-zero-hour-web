@@ -53,35 +53,44 @@ static int hexDigitToInt(char c)
 }
 
 // Convert unicode strings into ascii quoted-printable strings
+// GeneralsX @bugfix 09/11/2026 Walk WideChars, not bytes: wchar_t is 4 bytes on wasm/Linux, so the byte
+// walk stopped at the first 00 00 and saved "Player12" as "P". Each char is written as its two
+// UTF-16LE bytes, the format Windows (2-byte wchar_t) has always produced.
+static void appendQuotedByte(char *dest, int &i, unsigned char b)
+{
+	if (!isalnum(b))
+	{
+		dest[i++] = MAGIC_CHAR;
+		dest[i++] = intToHexDigit(b>>4);
+		dest[i++] = intToHexDigit(b&0xf);
+	}
+	else
+	{
+		dest[i++] = b;
+	}
+}
+
 AsciiString UnicodeStringToQuotedPrintable(UnicodeString original)
 {
 	static char dest[1024];
-	const unsigned char *src = reinterpret_cast<const unsigned char *>(original.str());
+	const WideChar *src = original.str();
 	int i=0;
-	while ( !(src[0]=='\0' && src[1]=='\0') && i<1021 )
+	while ( *src != 0 && i<1018 )
 	{
-		if (!isalnum(*src))
+		unsigned int ch = (unsigned int)*src++;
+		if (ch > 0xFFFF && ch <= 0x10FFFF)
 		{
-			dest[i++] = MAGIC_CHAR;
-			dest[i++] = intToHexDigit((*src)>>4);
-			dest[i++] = intToHexDigit((*src)&0xf);
+			// Beyond the BMP (emoji): write the UTF-16 surrogate pair Windows would store.
+			if (i >= 1012)
+				break; // both units won't fit; don't write half a pair
+			ch -= 0x10000;
+			const unsigned int hi = 0xD800 | (ch >> 10);
+			appendQuotedByte(dest, i, (unsigned char)(hi & 0xff));
+			appendQuotedByte(dest, i, (unsigned char)(hi >> 8));
+			ch = 0xDC00 | (ch & 0x3FF);
 		}
-		else
-		{
-			dest[i++] = *src;
-		}
-		src ++;
-		if (!isalnum(*src))
-		{
-			dest[i++] = MAGIC_CHAR;
-			dest[i++] = intToHexDigit((*src)>>4);
-			dest[i++] = intToHexDigit((*src)&0xf);
-		}
-		else
-		{
-			dest[i++] = *src;
-		}
-		src ++;
+		appendQuotedByte(dest, i, (unsigned char)(ch & 0xff));
+		appendQuotedByte(dest, i, (unsigned char)((ch >> 8) & 0xff));
 	}
 	dest[i] = '\0';
 
@@ -114,16 +123,19 @@ AsciiString AsciiStringToQuotedPrintable(AsciiString original)
 }
 
 // Convert ascii quoted-printable strings into unicode strings
+// GeneralsX @bugfix 09/11/2026 Rebuild each WideChar from two UTF-16LE bytes (see above), whatever
+// sizeof(WideChar) is.
 UnicodeString QuotedPrintableToUnicodeString(AsciiString original)
 {
 	static WideChar dest[1024];
 	int i=0;
-
-	unsigned char *c = reinterpret_cast<unsigned char *>(dest);
+	int byteIndex=0;
+	unsigned int ch=0;
 	const unsigned char *src = reinterpret_cast<const unsigned char *>(original.str());
 
 	while (*src && i<1023)
 	{
+		unsigned char b;
 		if (*src == MAGIC_CHAR)
 		{
 			if (src[1] == '\0')
@@ -131,35 +143,39 @@ UnicodeString QuotedPrintableToUnicodeString(AsciiString original)
 				// string ends with MAGIC_CHAR
 				break;
 			}
-			*c = hexDigitToInt(src[1]);
+			b = hexDigitToInt(src[1]);
 			src++;
 			if (src[1] != '\0')
 			{
-				*c = *c<<4;
-				*c = *c | hexDigitToInt(src[1]);
+				b = (unsigned char)((b<<4) | hexDigitToInt(src[1]));
 				src++;
 			}
 		}
 		else
 		{
-			*c = *src;
+			b = *src;
 		}
 		src++;
-		c++;
-	}
 
-	// Fixup odd-length strings
-	if ((c-(unsigned char *)dest)%2)
-	{
-		// OK
+		ch |= ((unsigned int)b) << (8*byteIndex);
+		if (++byteIndex == 2)
+		{
+			if (ch == 0)
+				break;
+			// Where WideChar holds a full code point, join a UTF-16 surrogate pair back into one.
+			if (sizeof(WideChar) > 2 && ch >= 0xDC00 && ch <= 0xDFFF && i > 0
+				&& (unsigned int)dest[i-1] >= 0xD800 && (unsigned int)dest[i-1] <= 0xDBFF)
+				dest[i-1] = (WideChar)(0x10000 + ((((unsigned int)dest[i-1]) - 0xD800) << 10) + (ch - 0xDC00));
+			else
+				dest[i++] = (WideChar)ch;
+			ch = 0;
+			byteIndex = 0;
+		}
 	}
-	else
-	{
-		*c = '\0';
-		c++;
-	}
-
-	*c = 0;
+	// An odd trailing byte is a char whose high byte was cut off.
+	if (byteIndex == 1 && ch != 0 && i<1023)
+		dest[i++] = (WideChar)ch;
+	dest[i] = 0;
 
 	return dest;
 }

@@ -37,7 +37,7 @@
 #include "GameNetwork/udp.h"
 #include "GameNetwork/networkutil.h"
 
-#include <queue>
+#include <deque>
 #include <vector>
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -128,9 +128,13 @@ struct VirtualPacket {
   std::vector<unsigned char> data;
   unsigned int fromIP;
   unsigned short fromPort;
+  unsigned short toPort;
 };
 
-static std::queue<VirtualPacket> g_virtualPacketQueue;
+// GeneralsX @bugfix 09/11/2026 One queue for all sockets let the lobby socket (8086) eat the
+// game socket's (8088) packets and vice versa. Packets now carry their destination port and
+// each socket reads only its own, like real UDP.
+static std::deque<VirtualPacket> g_virtualPacketQueue;
 bool g_useVirtualNetworking = false;
 unsigned char g_virtualIP_a = 127;
 unsigned char g_virtualIP_b = 0;
@@ -140,9 +144,7 @@ unsigned char g_virtualIP_d = 1;
 extern "C" {
   EMSCRIPTEN_KEEPALIVE void GX_Network_EnableVirtual(bool enable) {
     g_useVirtualNetworking = enable;
-    while (!g_virtualPacketQueue.empty()) {
-      g_virtualPacketQueue.pop();
-    }
+    g_virtualPacketQueue.clear();
   }
 
   EMSCRIPTEN_KEEPALIVE void GX_Network_SetVirtualIP(unsigned char a, unsigned char b, unsigned char c, unsigned char d) {
@@ -152,13 +154,18 @@ extern "C" {
     g_virtualIP_d = d;
   }
 
-  EMSCRIPTEN_KEEPALIVE void GX_Network_PushPacket(const unsigned char *data, int len, unsigned int fromIP, unsigned short fromPort) {
+  EMSCRIPTEN_KEEPALIVE void GX_Network_PushPacket(const unsigned char *data, int len, unsigned int fromIP, unsigned short fromPort, unsigned short toPort) {
     if (!g_useVirtualNetworking) return;
     VirtualPacket packet;
     packet.data.assign(data, data + len);
     packet.fromIP = fromIP;
     packet.fromPort = fromPort;
-    g_virtualPacketQueue.push(packet);
+    packet.toPort = toPort;
+    g_virtualPacketQueue.push_back(packet);
+    // Packets for a port nobody has bound would pile up forever; drop the oldest, as UDP would.
+    if (g_virtualPacketQueue.size() > 1024) {
+      g_virtualPacketQueue.pop_front();
+    }
   }
 }
 
@@ -279,11 +286,11 @@ Int UDP::Write(const unsigned char *msg, UnsignedInt len, UnsignedInt IP,
     EM_ASM({
       if (typeof window !== 'undefined' && window['GeneralsX'] &&
           typeof window['GeneralsX']['onSendPacket'] === 'function') {
-        var data = new Uint8Array(Module.HEAPU8.buffer, $0, $1);
+        var data = new Uint8Array(Module['HEAPU8'].buffer, $0, $1);
         var copy = new Uint8Array(data);
-        window['GeneralsX']['onSendPacket'](copy, $2, $3);
+        window['GeneralsX']['onSendPacket'](copy, $2, $3, $4);
       }
-    }, msg, len, IP, port);
+    }, msg, len, IP, port, myPort);
 #endif
     return (Int)len;
   }
@@ -323,11 +330,15 @@ Int UDP::Write(const unsigned char *msg, UnsignedInt len, UnsignedInt IP,
 
 Int UDP::Read(unsigned char *msg, UnsignedInt len, sockaddr_in *from) {
   if (g_useVirtualNetworking) {
-    if (g_virtualPacketQueue.empty()) {
-      return 0; // No data available
+    std::deque<VirtualPacket>::iterator it = g_virtualPacketQueue.begin();
+    while (it != g_virtualPacketQueue.end() && it->toPort != myPort) {
+      ++it;
     }
-    VirtualPacket packet = g_virtualPacketQueue.front();
-    g_virtualPacketQueue.pop();
+    if (it == g_virtualPacketQueue.end()) {
+      return 0; // No data available for this socket
+    }
+    VirtualPacket packet = *it;
+    g_virtualPacketQueue.erase(it);
 
     unsigned int toCopy = packet.data.size();
     if (toCopy > len) {
