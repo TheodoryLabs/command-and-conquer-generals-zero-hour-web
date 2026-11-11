@@ -45,7 +45,7 @@ static const char* g_VertexShaderSource = R"GLSL(#version 300 es
 precision highp float;
 
 // Vertex attributes (matching FVF decoder attribute locations)
-layout(location = 0) in vec3 a_Position;
+layout(location = 0) in vec4 a_Position;  // xyz (w defaults to 1), or XYZRHW
 layout(location = 1) in vec3 a_Normal;
 layout(location = 2) in vec4 a_Color;       // DX8 DIFFUSE (BGRA byte order in memory)
 layout(location = 3) in vec2 a_TexCoord0;
@@ -87,8 +87,15 @@ struct Light {
     float attenuation0;
     float attenuation1;
     float attenuation2;
+    vec4 ambient;
+    float range;       // point/spot: no light beyond this distance
 };
 uniform Light u_Lights[4];
+
+// D3DFVF_XYZRHW: positions are already in render-target pixels, with 1/w.
+// D3D skips transform, lighting and vertex fog for them.
+uniform bool u_PreTransformed;
+uniform vec4 u_ViewportRect; // x, y, width, height in pixels
 
 // Global ambient light (DX8 D3DRS_AMBIENT default)
 uniform vec4 u_GlobalAmbient;
@@ -132,12 +139,26 @@ vec3 stage_texcoord(int i, vec3 eyePos, vec3 eyeNormal) {
 }
 
 void main() {
+    vec4 vertexColor = a_Color.bgra;
+    if (u_PreTransformed) {
+        float w = a_Position.w > 0.0 ? 1.0 / a_Position.w : 1.0;
+        // D3D pixel centres are at integer coordinates, GL's at +0.5.
+        vec2 p = (a_Position.xy + 0.5 - u_ViewportRect.xy) / u_ViewportRect.zw;
+        gl_Position = vec4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, a_Position.z * 2.0 - 1.0, 1.0) * w;
+        v_Color = vertexColor;
+        v_TexCoord0 = vec3(a_TexCoord0, 1.0);
+        v_TexCoord1 = vec3(a_TexCoord1, 1.0);
+        v_TexCoord2 = vec3(a_TexCoord2, 1.0);
+        v_TexCoord3 = vec3(a_TexCoord3, 1.0);
+        v_FogFactor = 1.0;
+        return;
+    }
     mat4 worldMat = u_World;
     if (u_InstancingEnabled) {
         worldMat = a_InstanceWorld;
     }
     // Transform position through World * View * Projection
-    vec4 worldPos = worldMat * vec4(a_Position, 1.0);
+    vec4 worldPos = worldMat * vec4(a_Position.xyz, 1.0);
     vec4 viewPos = u_View * worldPos;
     gl_Position = u_Projection * viewPos;
     // Map D3D projection depth [0, w] to OpenGL ES clip space depth [-w, w]
@@ -147,7 +168,6 @@ void main() {
     // DX8 stores vertex colors as BGRA in memory. When read as GL_UNSIGNED_BYTE
     // with GL_RGBA format, the bytes map to: R=B, G=G, B=R, A=A
     // We need to swap R and B channels.
-    vec4 vertexColor = a_Color.bgra;
 
     vec3 eyeNormal = normalize(mat3(u_View) * (mat3(worldMat) * a_Normal));
     v_TexCoord0 = stage_texcoord(0, viewPos.xyz, eyeNormal);
@@ -166,7 +186,7 @@ void main() {
         // Global ambient contribution
         vec4 matAmb = (u_ColorVertex & 1) != 0 ? vertexColor : u_MatAmbient;
         vec4 matDiff = (u_ColorVertex & 2) != 0 ? vertexColor : u_MatDiffuse;
-        vec4 ambient = matAmb * u_GlobalAmbient;
+        vec4 lightAmbient = u_GlobalAmbient; // D3D: global + sum of attenuated light ambients
 
         // Per-light contribution
         for (int i = 0; i < 4; i++) {
@@ -182,7 +202,8 @@ void main() {
                 // Point light — direction from vertex to light
                 vec3 toLight = u_Lights[i].position - worldPos.xyz;
                 float dist = length(toLight);
-                lightDir = toLight / dist;
+                if (dist > u_Lights[i].range) continue;
+                lightDir = dist > 0.0 ? toLight / dist : vec3(0.0, 0.0, 1.0);
                 attenuation = 1.0 / (u_Lights[i].attenuation0
                     + u_Lights[i].attenuation1 * dist
                     + u_Lights[i].attenuation2 * dist * dist);
@@ -190,7 +211,8 @@ void main() {
                 // Spot light — simplified as point with direction check
                 vec3 toLight = u_Lights[i].position - worldPos.xyz;
                 float dist = length(toLight);
-                lightDir = toLight / dist;
+                if (dist > u_Lights[i].range) continue;
+                lightDir = dist > 0.0 ? toLight / dist : vec3(0.0, 0.0, 1.0);
                 attenuation = 1.0 / (u_Lights[i].attenuation0
                     + u_Lights[i].attenuation1 * dist
                     + u_Lights[i].attenuation2 * dist * dist);
@@ -202,9 +224,10 @@ void main() {
             float NdotL = max(dot(worldNormal, lightDir), 0.0);
 
             totalDiffuse += matDiff * u_Lights[i].diffuse * NdotL * attenuation;
+            lightAmbient += u_Lights[i].ambient * attenuation;
         }
 
-        v_Color = clamp(totalDiffuse + ambient, 0.0, 1.0);
+        v_Color = clamp(totalDiffuse + matAmb * lightAmbient, 0.0, 1.0);
         v_Color.a = matDiff.a;
     } else {
         // No lighting — use vertex color directly (UI, 2D elements, terrain decals)
@@ -213,7 +236,7 @@ void main() {
 
     // Fog factor (linear fog in eye space)
     if (u_FogEnabled && u_FogEnd > u_FogStart) {
-        float eyeDist = length(viewPos.xyz);
+        float eyeDist = abs(viewPos.z); // D3D vertex fog uses eye-space z (no RANGEFOGENABLE)
         v_FogFactor = clamp((u_FogEnd - eyeDist) / (u_FogEnd - u_FogStart), 0.0, 1.0);
     } else {
         v_FogFactor = 1.0;
@@ -272,6 +295,12 @@ uniform int u_Stage1_ColorOp;
 uniform int u_Stage0_AlphaOp;
 uniform int u_Stage1_AlphaOp;
 
+// D3DTSS_COLORARG0/1/2, ALPHAARG0/1/2 for stages 0 and 1 (D3DTA_*: low 4 bits select,
+// 0x10 COMPLEMENT, 0x20 ALPHAREPLICATE). Bit n of u_TexBound: stage n has a texture
+// (D3D reads an unbound stage's texture as opaque white).
+uniform int u_StageArgs[12];
+uniform int u_TexBound;
+
 // Output
 out vec4 fragColor;
 
@@ -291,8 +320,17 @@ bool alpha_test(float alpha) {
     return true;
 }
 
+vec4 stage_arg(int a, vec4 diffuse, vec4 current, vec4 tex) {
+    int sel = a & 15;
+    vec4 v = sel == 0 ? diffuse : sel == 2 ? tex : sel == 3 ? u_TextureFactor
+           : sel == 4 ? vec4(0.0) : current; // 1 CURRENT; 4 SPECULAR (none); 5 TEMP as CURRENT
+    if ((a & 16) != 0) v = vec4(1.0) - v;
+    if ((a & 32) != 0) v = vec4(v.a);
+    return v;
+}
+
 // Apply a texture stage color operation
-vec3 apply_color_op(int op, vec4 arg1, vec4 arg2) {
+vec3 apply_color_op(int op, vec4 arg1, vec4 arg2, vec4 arg0) {
     if (op <= 1) return arg2.rgb;            // DISABLE → pass through
     if (op == 2) return arg1.rgb;            // SELECTARG1
     if (op == 3) return arg2.rgb;            // SELECTARG2
@@ -304,14 +342,11 @@ vec3 apply_color_op(int op, vec4 arg1, vec4 arg2) {
     if (op == 9) return clamp((arg1.rgb + arg2.rgb - vec3(0.5)) * 2.0, 0.0, 1.0); // ADDSIGNED2X
     if (op == 13) return mix(arg2.rgb, arg1.rgb, arg1.a); // BLENDTEXTUREALPHA
     if (op == 16) return mix(arg2.rgb, arg1.rgb, arg2.a); // BLENDCURRENTALPHA
-    if (op == 18) return clamp(arg1.rgb * arg2.a + arg2.rgb, 0.0, 1.0); // MODULATEALPHA_ADDCOLOR
+    if (op == 18) return clamp(arg1.rgb + arg1.a * arg2.rgb, 0.0, 1.0); // MODULATEALPHA_ADDCOLOR
     if (op == 24) { // DOTPRODUCT3
-        float dp = 4.0 * dot(arg2.rgb - vec3(0.5), u_TextureFactor.rgb - vec3(0.5));
-        return vec3(dp);
+        return vec3(clamp(4.0 * dot(arg1.rgb - vec3(0.5), arg2.rgb - vec3(0.5)), 0.0, 1.0));
     }
-    if (op == 25) { // MULTIPLYADD
-        return vec3(u_TextureFactor.a) * arg1.rgb + vec3(u_TextureFactor.a);
-    }
+    if (op == 25) return arg0.rgb + arg1.rgb * arg2.rgb; // MULTIPLYADD
     return arg1.rgb * arg2.rgb;                  // default: MODULATE
 }
 
@@ -326,21 +361,28 @@ float apply_alpha_op(int op, float arg1, float arg2) {
 }
 
 void main() {
-    vec4 color = v_Color;
+    vec4 diffuse = v_Color;
+    vec4 color = v_Color; // CURRENT: the diffuse colour at stage 0
 
-    // --- Texture Stage 0 ---
-    if (u_TextureStageCount >= 1) {
-        vec4 tex0 = texture(u_Texture0, v_TexCoord0.xy / v_TexCoord0.z);
-        // Default operation: MODULATE (texture × diffuse)
-        color.rgb = apply_color_op(u_Stage0_ColorOp, tex0, color);
-        color.a   = apply_alpha_op(u_Stage0_AlphaOp, tex0.a, color.a);
-    }
-
-    // --- Texture Stage 1 (lightmaps, detail textures) ---
-    if (u_TextureStageCount >= 2) {
-        vec4 tex1 = texture(u_Texture1, v_TexCoord1.xy / v_TexCoord1.z);
-        color.rgb = apply_color_op(u_Stage1_ColorOp, tex1, color);
-        color.a   = apply_alpha_op(u_Stage1_AlphaOp, tex1.a, color.a);
+    // --- Texture Stages 0 and 1 (base; lightmaps, detail textures) ---
+    for (int s = 0; s < 2; s++) {
+        if (u_TextureStageCount <= s) break;
+        vec4 tex = vec4(1.0);
+        if ((u_TexBound & (1 << s)) != 0)
+            tex = s == 0 ? texture(u_Texture0, v_TexCoord0.xy / v_TexCoord0.z)
+                         : texture(u_Texture1, v_TexCoord1.xy / v_TexCoord1.z);
+        int cop = s == 0 ? u_Stage0_ColorOp : u_Stage1_ColorOp;
+        int aop = s == 0 ? u_Stage0_AlphaOp : u_Stage1_AlphaOp;
+        if (cop <= 1) break; // D3DTOP_DISABLE ends the chain here
+        int b = s * 6;
+        vec4 c0 = stage_arg(u_StageArgs[b + 0], diffuse, color, tex);
+        vec4 c1 = stage_arg(u_StageArgs[b + 1], diffuse, color, tex);
+        vec4 c2 = stage_arg(u_StageArgs[b + 2], diffuse, color, tex);
+        float a1 = stage_arg(u_StageArgs[b + 4], diffuse, color, tex).a;
+        float a2 = stage_arg(u_StageArgs[b + 5], diffuse, color, tex).a;
+        vec3 rgb = apply_color_op(cop, c1, c2, c0);
+        if (aop > 1) color.a = apply_alpha_op(aop, a1, a2);
+        color.rgb = rgb;
     }
 
     // --- Texture Stage 2 (rare — special effects) ---

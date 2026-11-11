@@ -1517,3 +1517,39 @@ headless Edge (`--use-angle=gl`) with a LAN game on Alpine Assault (USA, Rangers
 Verified: Rangers are textured with their team colour; vehicles keep theirs; Options lists the
 modes, 1280x720 applies at once (16:9 canvas, UI re-laid out, clicks land) and survives a
 reload; Very High sticks; the shell map now plays behind the main menu.
+
+## 2026-11-11 — Session 18: Fixes from an adversarial rendering review
+
+Three independent reviewers read the GLES3/D3D8 shim against D3D8 semantics; these are the
+must-fix findings, each checked in the code first.
+
+- **Texture stage arguments were ignored.** The fragment shader always combined arg1 = texture and
+  arg2 = current. It now reads D3DTSS_COLORARG0/1/2 and ALPHAARG0/1/2 for stages 0-1, with the
+  COMPLEMENT / ALPHAREPLICATE modifiers; a stage with no texture reads TEXTURE as white (D3D), not
+  WebGL's black; COLOROP DISABLE ends the chain. MULTIPLYADD is arg0 + arg1·arg2 and DOT3 is
+  4·dot(arg1-½, arg2-½), which keeps render2d's grayscale path identical. Stage args default to
+  D3D's (TEXTURE, CURRENT).
+- **Fog never showed.** FOGSTART/FOGEND arrive as float bits and were dropped, so start = end = 0.
+  Stored now; the fog distance is eye-space z, as D3D vertex fog without RANGEFOGENABLE.
+- **Texture uploads stole another stage's binding.** Create/Update_Texture bound to whichever unit
+  was active; they now restore that unit's texture.
+- **Non-indexed and UP draws applied BaseVertexIndex.** A leftover SetIndices base shifted the
+  shadow-darkening and occluded-player-colour quads past their 80-byte VBO. Only
+  DrawIndexedPrimitive uses the base now.
+- **XYZRHW vertices went through World·View·Projection.** They are screen pixels with 1/w; the
+  vertex shader maps them straight to clip space (D3D pixel centres at +0.5) and skips lighting and fog.
+- **Stencil.** Only STENCILENABLE reached GL. Func/ref/mask/ops/write mask are forwarded, and the
+  canvas now asks for an 8-bit stencil buffer (EmscriptenMain.cpp): it had none, so once the quads
+  above drew, the player-colour quad tinted the whole view red. Clear ignores the write masks, as
+  D3D's Clear does.
+- **Point lights** now stop at Range and add their Ambient (D3D: global + Σ attenuated light ambient).
+- **Render-state cache.** Session 17 said this cache "must start at 0 like DX8Wrapper::RenderStates";
+  that was wrong: the engine's cache starts at 0x12345678 (Invalidate_Cached_Render_States). The
+  redundant-state skip here dropped the engine's first "set to 0" (TEXTUREFACTOR stayed white,
+  AMBIENT stayed 0.2). The skip is gone; the engine already filters repeats.
+
+Verified: same LAN game on Alpine Assault in headless Edge (ANGLE-GL) renders the same as the
+deployed build (only the flashing general's button differs), 8 stencil bits, no WebGL errors.
+Not exercised by that scene: fog, stencil shadows, point lights. Still open (should-fix): stages
+2-3 always modulate, missing ADDSMOOTH/SUBTRACT/specular, SetRenderTarget no-op, authored mips
+replaced by glGenerateMipmap, small DXT mips under-allocated, no S3TC fallback.

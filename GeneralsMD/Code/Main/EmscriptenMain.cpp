@@ -563,6 +563,9 @@ int main(int argc, char *argv[]) {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+    // Stencil shadows and the behind-building player colour need a stencil buffer;
+    // without one their full-screen quads cover the whole view.
+    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
     
     int canvas_width = 800;
     int canvas_height = 600;

@@ -210,6 +210,7 @@ void GLES3_FVFDecoder::Apply_Vertex_Attribs(unsigned int stride,
     // WebGL2 does NOT support GL_BGRA, so we pass as GL_RGBA and swizzle
     // in the vertex shader (swap .r and .b).
     GLES3_Set_Vertex_Has_Color((fvf & D3DFVF_DIFFUSE) != 0);
+    GLES3_Set_Pretransformed((fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW);
     if (fvf & D3DFVF_DIFFUSE) {
         glEnableVertexAttribArray(ATTR_COLOR);
         glVertexAttribPointer(

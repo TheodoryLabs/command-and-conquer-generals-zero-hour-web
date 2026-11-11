@@ -97,6 +97,13 @@ enum GLES3_RenderState {
   GLES3_RS_EMISSIVEMATERIALSOURCE = 148,
   GLES3_RS_NORMALIZENORMALS = 143,
   GLES3_RS_STENCILENABLE = 52,
+  GLES3_RS_STENCILFAIL = 53,
+  GLES3_RS_STENCILZFAIL = 54,
+  GLES3_RS_STENCILPASS = 55,
+  GLES3_RS_STENCILFUNC = 56,
+  GLES3_RS_STENCILREF = 57,
+  GLES3_RS_STENCILMASK = 58,
+  GLES3_RS_STENCILWRITEMASK = 59,
   GLES3_RS_TEXTUREFACTOR = 60,
   GLES3_RS_ZBIAS = 47,
   GLES3_RS_MAX = 256
@@ -144,6 +151,8 @@ enum GLES3_TextureStageState {
   GLES3_TSS_MINFILTER = 17,
   GLES3_TSS_MIPFILTER = 18,
   GLES3_TSS_TEXTURETRANSFORMFLAGS = 24,
+  GLES3_TSS_COLORARG0 = 26,
+  GLES3_TSS_ALPHAARG0 = 27,
   GLES3_TSS_MAX = 32
 };
 
@@ -231,6 +240,7 @@ struct GLES3_PipelineState {
   // Render states
   unsigned int render_states[GLES3_RS_MAX];
   bool vertex_has_color; // current FVF carries D3DFVF_DIFFUSE
+  bool pretransformed;   // current FVF is D3DFVF_XYZRHW (screen-space positions)
 
   // Alpha test (emulated in fragment shader since GLES3 removed it)
   bool alpha_test_enabled;
@@ -277,6 +287,8 @@ struct GLES3_ProgramUniformLocations {
     GLint attenuation0;
     GLint attenuation1;
     GLint attenuation2;
+    GLint ambient;
+    GLint range;
   } u_Lights[4];
   GLint u_FogEnabled;
   GLint u_FogColor;
@@ -292,6 +304,10 @@ struct GLES3_ProgramUniformLocations {
   GLint u_Stage0_AlphaOp;
   GLint u_Stage1_AlphaOp;
   GLint u_ColorVertex;
+  GLint u_StageArgs;
+  GLint u_TexBound;
+  GLint u_PreTransformed;
+  GLint u_ViewportRect;
   GLint u_TextureFactor;
   GLint u_InstancingEnabled;
   GLint u_TexCoordIndex;
@@ -402,6 +418,7 @@ private:
 namespace GLES3_Helpers {
 GLenum Blend_To_GL(unsigned int dx8_blend);
 GLenum CmpFunc_To_GL(unsigned int dx8_cmp);
+GLenum StencilOp_To_GL(unsigned int dx8_op);
 GLenum CullMode_To_GL(unsigned int dx8_cull);
 GLenum PrimType_To_GL(unsigned int dx8_prim);
 GLenum AddressMode_To_GL(unsigned int dx8_addr);
@@ -446,6 +463,7 @@ bool GLES3_Texture_Has_Mipmaps(GLuint tex);
 void GLES3_Set_Light(unsigned int index, const GLES3_Light* light);
 void GLES3_Enable_Light(unsigned int index, bool enable);
 void GLES3_Set_Vertex_Has_Color(bool has_color);
+void GLES3_Set_Pretransformed(bool pretransformed);
 void GLES3_Set_Material(const GLES3_Material* mat);
 void GLES3_Set_Fog(bool enable, float r, float g, float b,
                     float start, float end);

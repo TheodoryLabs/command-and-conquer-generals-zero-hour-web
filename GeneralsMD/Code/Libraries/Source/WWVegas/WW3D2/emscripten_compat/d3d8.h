@@ -1021,13 +1021,15 @@ struct Emscripten_IDirect3DDevice8 : public IDirect3DDevice8 {
     // bytes. With this in place, the engine's indices [0,1,2,3] correctly
     // address THIS draw's vertices instead of vertices 0..3 of the shared
     // dynamic VBO (which would be whoever wrote first this frame).
-    void _setup_vertex_attribs(UINT stride_override = 0) {
+    // D3D applies BaseVertexIndex (SetIndices) to DrawIndexedPrimitive only; the
+    // non-indexed and UP draws pass use_base = false.
+    void _setup_vertex_attribs(UINT stride_override, bool use_base) {
         if (!current_fvf) return;
         GLES3_FVFDecoder dec;
         dec.Decode(current_fvf);
         UINT stride = stride_override ? stride_override : current_stride;
         if (stride == 0) stride = dec.Get_FVF_Size();
-        const UINT base_offset_bytes = (UINT)base_vtx_index * stride;
+        const UINT base_offset_bytes = use_base ? (UINT)base_vtx_index * stride : 0;
         dec.Apply_Vertex_Attribs(stride, base_offset_bytes);
     }
 
@@ -1035,7 +1037,7 @@ struct Emscripten_IDirect3DDevice8 : public IDirect3DDevice8 {
                                 UINT PrimCount) override {
         if (!current_vb || current_vb->data.empty()) return 0;
         current_vb->Upload_And_Bind();
-        _setup_vertex_attribs();
+        _setup_vertex_attribs(0, false);
         GLES3_Draw_Arrays((unsigned int)PrimType, StartVertex, PrimCount);
         return 0;
     }
@@ -1061,7 +1063,7 @@ struct Emscripten_IDirect3DDevice8 : public IDirect3DDevice8 {
         glBufferData(GL_ARRAY_BUFFER,
                      (GLsizeiptr)(vertex_count * VertexStreamZeroStride),
                      pVertexStreamZeroData, GL_DYNAMIC_DRAW);
-        _setup_vertex_attribs(VertexStreamZeroStride);
+        _setup_vertex_attribs(VertexStreamZeroStride, false);
         GLES3_Draw_Arrays((unsigned int)PrimType, 0, PrimCount);
         glDeleteBuffers(1, &tmp_vbo);
         return 0;
@@ -1080,7 +1082,7 @@ struct Emscripten_IDirect3DDevice8 : public IDirect3DDevice8 {
         if (current_ib->data.empty()) { ++gx_d3d_dip_empty_ib; return 0; }
         current_vb->Upload_And_Bind();
         current_ib->Upload_And_Bind();
-        _setup_vertex_attribs();
+        _setup_vertex_attribs(0, true);
         GLES3_Draw_Triangles((unsigned int)PrimType, StartIndex, PrimCount,
                              MinIndex, NumVertices);
         ++gx_d3d_dip_drew;
@@ -1110,7 +1112,7 @@ struct Emscripten_IDirect3DDevice8 : public IDirect3DDevice8 {
         glBufferData(GL_ARRAY_BUFFER,
                      (GLsizeiptr)(NumVertices * VertexStreamZeroStride),
                      pVertexStreamZeroData, GL_DYNAMIC_DRAW);
-        _setup_vertex_attribs(VertexStreamZeroStride);
+        _setup_vertex_attribs(VertexStreamZeroStride, false);
         // Upload indices (GLES3_Draw_Triangles expects GL_UNSIGNED_SHORT)
         UINT idx_bytes = (IndexDataFormat == D3DFMT_INDEX16) ? 2 : 4;
         GLuint tmp_ibo = 0;

@@ -86,6 +86,8 @@ struct GLES3_CachedUniformState {
         float attenuation0;
         float attenuation1;
         float attenuation2;
+        float ambient[4];
+        float range;
     } lights[4];
     int fog_enabled;
     float fog_color[3];
@@ -97,6 +99,10 @@ struct GLES3_CachedUniformState {
     int tex_stage_count;
     int s0_cop, s1_cop, s0_aop, s1_aop;
     int color_vertex;
+    int stage_args[12];
+    int tex_bound;
+    int pretransformed;
+    float viewport_rect[4];
     float texture_factor[4];
     int tex_coord_index[4];
     int tex_transform[4];
@@ -124,6 +130,19 @@ GLenum Blend_To_GL(unsigned int dx8_blend) {
         case GLES3_BLEND_INVDESTCOLOR: return GL_ONE_MINUS_DST_COLOR;
         case GLES3_BLEND_SRCALPHASAT:  return GL_SRC_ALPHA_SATURATE;
         default: return GL_ONE;
+    }
+}
+
+GLenum StencilOp_To_GL(unsigned int dx8_op) {
+    switch (dx8_op) {
+        case 2: return GL_ZERO;
+        case 3: return GL_REPLACE;
+        case 4: return GL_INCR;       // D3DSTENCILOP_INCRSAT
+        case 5: return GL_DECR;       // D3DSTENCILOP_DECRSAT
+        case 6: return GL_INVERT;
+        case 7: return GL_INCR_WRAP;  // D3DSTENCILOP_INCR
+        case 8: return GL_DECR_WRAP;  // D3DSTENCILOP_DECR
+        default: return GL_KEEP;      // 1 = KEEP
     }
 }
 
@@ -257,7 +276,24 @@ bool GLES3_Init(void* hwnd, bool lite) {
         g_State.texture_stage_state[i][GLES3_TSS_MINFILTER] = 2; // LINEAR
         g_State.texture_stage_state[i][GLES3_TSS_MIPFILTER] = 0; // NONE
         g_State.texture_stage_state[i][GLES3_TSS_TEXCOORDINDEX] = i; // D3D default: UV set = stage
+        // D3D defaults: ARG1 = TEXTURE, ARG2 = CURRENT, ARG0 = CURRENT
+        g_State.texture_stage_state[i][GLES3_TSS_COLORARG1] = 2;
+        g_State.texture_stage_state[i][GLES3_TSS_COLORARG2] = 1;
+        g_State.texture_stage_state[i][GLES3_TSS_ALPHAARG1] = 2;
+        g_State.texture_stage_state[i][GLES3_TSS_ALPHAARG2] = 1;
+        g_State.texture_stage_state[i][GLES3_TSS_COLORARG0] = 1;
+        g_State.texture_stage_state[i][GLES3_TSS_ALPHAARG0] = 1;
     }
+    // D3D stencil defaults, which are also GL's: func ALWAYS, ops KEEP, masks all ones.
+    // GL is set up below with depth test and depth writes on; record that too.
+    g_State.render_states[GLES3_RS_ZENABLE] = 1;
+    g_State.render_states[GLES3_RS_ZWRITEENABLE] = 1;
+    g_State.render_states[GLES3_RS_STENCILFUNC] = 8;
+    g_State.render_states[GLES3_RS_STENCILFAIL] = 1;
+    g_State.render_states[GLES3_RS_STENCILZFAIL] = 1;
+    g_State.render_states[GLES3_RS_STENCILPASS] = 1;
+    g_State.render_states[GLES3_RS_STENCILMASK] = 0xFFFFFFFFu;
+    g_State.render_states[GLES3_RS_STENCILWRITEMASK] = 0xFFFFFFFFu;
 
 
     // Set identity matrices
@@ -357,7 +393,15 @@ void GLES3_Clear(bool clear_color, bool clear_z_stencil,
         glClearStencil(stencil);
         mask |= GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT;
     }
-    if (mask) glClear(mask);
+    if (!mask) return;
+    // D3D's Clear ignores the render states; GL's obeys its write masks and scissor.
+    const unsigned int* rs = g_State.render_states;
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_TRUE);
+    glStencilMask(0xFFFFFFFFu);
+    glClear(mask);
+    glDepthMask(rs[GLES3_RS_ZWRITEENABLE] ? GL_TRUE : GL_FALSE);
+    glStencilMask(rs[GLES3_RS_STENCILWRITEMASK]);
 }
 
 
@@ -373,7 +417,9 @@ void GLES3_Clear(bool clear_color, bool clear_z_stencil,
 */
 void GLES3_Set_Render_State(unsigned int state, unsigned int value) {
     if (state >= GLES3_RS_MAX) return;
-    if (g_State.render_states[state] == value) return; // skip redundant
+    // No redundant-state skip: DX8Wrapper already drops repeats against its own cache,
+    // which starts at 0x12345678 while this one starts at 0, so a skip here lost the
+    // engine's first "set to 0" (TEXTUREFACTOR, AMBIENT) and kept our start values.
     g_State.render_states[state] = value;
 
     switch (state) {
@@ -460,9 +506,38 @@ void GLES3_Set_Render_State(unsigned int state, unsigned int value) {
             else       glDisable(GL_STENCIL_TEST);
             break;
 
-        // States handled in shader uniforms (no direct GL equivalent):
+        case GLES3_RS_STENCILFUNC:
+        case GLES3_RS_STENCILREF:
+        case GLES3_RS_STENCILMASK: {
+            const unsigned int* rs = g_State.render_states;
+            glStencilFunc(GLES3_Helpers::CmpFunc_To_GL(rs[GLES3_RS_STENCILFUNC]),
+                          (GLint)rs[GLES3_RS_STENCILREF], rs[GLES3_RS_STENCILMASK]);
+            break;
+        }
+
+        case GLES3_RS_STENCILFAIL:
+        case GLES3_RS_STENCILZFAIL:
+        case GLES3_RS_STENCILPASS: {
+            const unsigned int* rs = g_State.render_states;
+            glStencilOp(GLES3_Helpers::StencilOp_To_GL(rs[GLES3_RS_STENCILFAIL]),
+                        GLES3_Helpers::StencilOp_To_GL(rs[GLES3_RS_STENCILZFAIL]),
+                        GLES3_Helpers::StencilOp_To_GL(rs[GLES3_RS_STENCILPASS]));
+            break;
+        }
+
+        case GLES3_RS_STENCILWRITEMASK:
+            glStencilMask(value);
+            break;
+
+        // D3D passes these floats as their bit patterns (DX8Wrapper::Set_Fog).
         case GLES3_RS_FOGSTART:
+            memcpy(&g_State.fog_start, &value, sizeof(float));
+            break;
         case GLES3_RS_FOGEND:
+            memcpy(&g_State.fog_end, &value, sizeof(float));
+            break;
+
+        // States handled in shader uniforms (no direct GL equivalent):
         case GLES3_RS_FOGDENSITY:
         case GLES3_RS_COLORVERTEX:
         case GLES3_RS_NORMALIZENORMALS:
@@ -645,6 +720,10 @@ void GLES3_Set_Light(unsigned int index, const GLES3_Light* light) {
 
 void GLES3_Set_Vertex_Has_Color(bool has_color) {
     g_State.vertex_has_color = has_color;
+}
+
+void GLES3_Set_Pretransformed(bool pretransformed) {
+    g_State.pretransformed = pretransformed;
 }
 
 void GLES3_Enable_Light(unsigned int index, bool enable) {
@@ -1015,6 +1094,10 @@ GLuint GLES3_TextureConverter::Create_Texture(unsigned int width,
                                                unsigned int dx8_format,
                                                unsigned int mip_levels,
                                                const void* data) {
+    // Uploads happen on whichever unit is active; put back what that unit had,
+    // or another stage keeps sampling this texture.
+    GLint prev_tex = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
     GLuint tex;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
@@ -1062,6 +1145,7 @@ GLuint GLES3_TextureConverter::Create_Texture(unsigned int width,
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
 
     GLES3_Register_Texture(tex, mip_levels > 1);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
     return tex;
 }
 
@@ -1075,10 +1159,10 @@ void GLES3_TextureConverter::Update_Texture(GLuint gl_tex_id,
                                             unsigned int dx8_format,
                                             unsigned int mip_levels,
                                             const void* data) {
-    if (!gl_tex_id) return;
+    if (!gl_tex_id || !data) return;
+    GLint prev_tex = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
     glBindTexture(GL_TEXTURE_2D, gl_tex_id);
-
-    if (!data) return;
 
     GLenum src_fmt, src_type;
     std::vector<unsigned char> temp_buffer;
@@ -1092,6 +1176,7 @@ void GLES3_TextureConverter::Update_Texture(GLuint gl_tex_id,
     if (mip_levels > 1) {
         glGenerateMipmap(GL_TEXTURE_2D);
     }
+    glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
 }
 
 
@@ -1214,6 +1299,10 @@ void GLES3_ShaderManager::Populate_Locations(GLuint program, unsigned int hash) 
         locs.u_Lights[i].attenuation1 = glGetUniformLocation(program, name);
         snprintf(name, sizeof(name), "u_Lights[%d].attenuation2", i);
         locs.u_Lights[i].attenuation2 = glGetUniformLocation(program, name);
+        snprintf(name, sizeof(name), "u_Lights[%d].ambient", i);
+        locs.u_Lights[i].ambient = glGetUniformLocation(program, name);
+        snprintf(name, sizeof(name), "u_Lights[%d].range", i);
+        locs.u_Lights[i].range = glGetUniformLocation(program, name);
     }
 
     locs.u_FogEnabled = glGetUniformLocation(program, "u_FogEnabled");
@@ -1236,6 +1325,10 @@ void GLES3_ShaderManager::Populate_Locations(GLuint program, unsigned int hash) 
     locs.u_Stage0_AlphaOp = glGetUniformLocation(program, "u_Stage0_AlphaOp");
     locs.u_Stage1_AlphaOp = glGetUniformLocation(program, "u_Stage1_AlphaOp");
     locs.u_ColorVertex = glGetUniformLocation(program, "u_ColorVertex");
+    locs.u_StageArgs = glGetUniformLocation(program, "u_StageArgs");
+    locs.u_TexBound = glGetUniformLocation(program, "u_TexBound");
+    locs.u_PreTransformed = glGetUniformLocation(program, "u_PreTransformed");
+    locs.u_ViewportRect = glGetUniformLocation(program, "u_ViewportRect");
     locs.u_TextureFactor = glGetUniformLocation(program, "u_TextureFactor");
     locs.u_InstancingEnabled = glGetUniformLocation(program, "u_InstancingEnabled");
     locs.u_TexCoordIndex = glGetUniformLocation(program, "u_TexCoordIndex");
@@ -1364,6 +1457,14 @@ void GLES3_ShaderManager::Apply_Uniforms(GLuint program,
                 glUniform1f(locs.u_Lights[i].attenuation2, state.lights[i].attenuation2);
                 cache.lights[i].attenuation2 = state.lights[i].attenuation2;
             }
+            if (locs.u_Lights[i].ambient != -1 && (!cache.initialized || memcmp(cache.lights[i].ambient, state.lights[i].ambient, sizeof(state.lights[i].ambient)) != 0)) {
+                glUniform4fv(locs.u_Lights[i].ambient, 1, state.lights[i].ambient);
+                memcpy(cache.lights[i].ambient, state.lights[i].ambient, sizeof(state.lights[i].ambient));
+            }
+            if (locs.u_Lights[i].range != -1 && (!cache.initialized || cache.lights[i].range != state.lights[i].range)) {
+                glUniform1f(locs.u_Lights[i].range, state.lights[i].range);
+                cache.lights[i].range = state.lights[i].range;
+            }
         } else {
             if (locs.u_Lights[i].enabled != -1 && (!cache.initialized || cache.lights[i].enabled != 0)) {
                 glUniform1i(locs.u_Lights[i].enabled, 0);
@@ -1471,6 +1572,42 @@ void GLES3_ShaderManager::Apply_Uniforms(GLuint program,
     if (locs.u_ColorVertex != -1 && (!cache.initialized || cache.color_vertex != c_vertex)) {
         glUniform1i(locs.u_ColorVertex, c_vertex);
         cache.color_vertex = c_vertex;
+    }
+
+    {
+        // Stages 0-1: COLORARG0/1/2 then ALPHAARG0/1/2 (D3DTA_* incl. modifier bits).
+        int args[12];
+        for (int st = 0; st < 2; st++) {
+            const unsigned int* t = state.texture_stage_state[st];
+            args[st * 6 + 0] = (int)t[GLES3_TSS_COLORARG0];
+            args[st * 6 + 1] = (int)t[GLES3_TSS_COLORARG1];
+            args[st * 6 + 2] = (int)t[GLES3_TSS_COLORARG2];
+            args[st * 6 + 3] = (int)t[GLES3_TSS_ALPHAARG0];
+            args[st * 6 + 4] = (int)t[GLES3_TSS_ALPHAARG1];
+            args[st * 6 + 5] = (int)t[GLES3_TSS_ALPHAARG2];
+        }
+        if (locs.u_StageArgs != -1 && (!cache.initialized || memcmp(cache.stage_args, args, sizeof(args)) != 0)) {
+            glUniform1iv(locs.u_StageArgs, 12, args);
+            memcpy(cache.stage_args, args, sizeof(args));
+        }
+        int bound = 0;
+        for (int st = 0; st < 4; st++) if (state.bound_textures[st]) bound |= 1 << st;
+        if (locs.u_TexBound != -1 && (!cache.initialized || cache.tex_bound != bound)) {
+            glUniform1i(locs.u_TexBound, bound);
+            cache.tex_bound = bound;
+        }
+        int pre = state.pretransformed ? 1 : 0;
+        if (locs.u_PreTransformed != -1 && (!cache.initialized || cache.pretransformed != pre)) {
+            glUniform1i(locs.u_PreTransformed, pre);
+            cache.pretransformed = pre;
+        }
+        float vp[4] = { (float)state.viewport.x, (float)state.viewport.y,
+                        (float)(state.viewport.width ? state.viewport.width : 1),
+                        (float)(state.viewport.height ? state.viewport.height : 1) };
+        if (locs.u_ViewportRect != -1 && (!cache.initialized || memcmp(cache.viewport_rect, vp, sizeof(vp)) != 0)) {
+            glUniform4fv(locs.u_ViewportRect, 1, vp);
+            memcpy(cache.viewport_rect, vp, sizeof(vp));
+        }
     }
 
     if (locs.u_TextureFactor != -1 && (!cache.initialized || memcmp(cache.texture_factor, state.texture_factor, sizeof(state.texture_factor)) != 0)) {
