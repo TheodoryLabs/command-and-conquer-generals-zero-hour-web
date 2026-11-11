@@ -53,6 +53,7 @@ layout(location = 4) in vec2 a_TexCoord1;
 layout(location = 5) in vec2 a_TexCoord2;
 layout(location = 6) in vec2 a_TexCoord3;
 layout(location = 7) in mat4 a_InstanceWorld; // Instanced matrix layout locations 7, 8, 9, 10
+layout(location = 11) in vec4 a_Specular;     // DX8 SPECULAR (BGRA), 0 when the FVF has none
 
 // Transform matrices
 uniform mat4 u_World;
@@ -89,6 +90,7 @@ struct Light {
     float attenuation2;
     vec4 ambient;
     float range;       // point/spot: no light beyond this distance
+    vec4 specular;
 };
 uniform Light u_Lights[4];
 
@@ -110,8 +112,13 @@ uniform float u_FogEnd;
 // bit 0 ambient, bit 1 diffuse, bit 2 emissive. Otherwise the material is used.
 uniform int u_ColorVertex;
 
+// D3DRS_SPECULARENABLE: lit vertices get Blinn-Phong highlights (local viewer, D3D's
+// default), unlit ones pass the vertex specular colour; the pixel stage adds it.
+uniform bool u_SpecularEnable;
+
 // Outputs to fragment shader
 out vec4 v_Color;
+out vec4 v_Specular;
 out vec3 v_TexCoord0; // xy, and the divisor for D3DTTFF_PROJECTED (else 1)
 out vec3 v_TexCoord1;
 out vec3 v_TexCoord2;
@@ -146,6 +153,7 @@ void main() {
         vec2 p = (a_Position.xy + 0.5 - u_ViewportRect.xy) / u_ViewportRect.zw;
         gl_Position = vec4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, a_Position.z * 2.0 - 1.0, 1.0) * w;
         v_Color = vertexColor;
+        v_Specular = a_Specular.bgra;
         v_TexCoord0 = vec3(a_TexCoord0, 1.0);
         v_TexCoord1 = vec3(a_TexCoord1, 1.0);
         v_TexCoord2 = vec3(a_TexCoord2, 1.0);
@@ -187,6 +195,10 @@ void main() {
         vec4 matAmb = (u_ColorVertex & 1) != 0 ? vertexColor : u_MatAmbient;
         vec4 matDiff = (u_ColorVertex & 2) != 0 ? vertexColor : u_MatDiffuse;
         vec4 lightAmbient = u_GlobalAmbient; // D3D: global + sum of attenuated light ambients
+        vec4 totalSpecular = vec4(0.0);
+        // Camera position in world space, for the local-viewer half vector.
+        vec3 camPos = -transpose(mat3(u_View)) * u_View[3].xyz;
+        vec3 toEye = normalize(camPos - worldPos.xyz);
 
         // Per-light contribution
         for (int i = 0; i < 4; i++) {
@@ -225,13 +237,19 @@ void main() {
 
             totalDiffuse += matDiff * u_Lights[i].diffuse * NdotL * attenuation;
             lightAmbient += u_Lights[i].ambient * attenuation;
+            if (u_SpecularEnable && NdotL > 0.0) {
+                float NdotH = max(dot(worldNormal, normalize(lightDir + toEye)), 0.0);
+                totalSpecular += u_Lights[i].specular * pow(NdotH, max(u_MatPower, 0.0001)) * attenuation;
+            }
         }
 
         v_Color = clamp(totalDiffuse + matAmb * lightAmbient, 0.0, 1.0);
         v_Color.a = matDiff.a;
+        v_Specular = clamp(u_MatSpecular * totalSpecular, 0.0, 1.0);
     } else {
         // No lighting — use vertex color directly (UI, 2D elements, terrain decals)
         v_Color = vertexColor;
+        v_Specular = a_Specular.bgra;
     }
 
     // Fog factor (linear fog in eye space)
@@ -278,28 +296,30 @@ uniform bool u_AlphaTestEnabled;
 uniform float u_AlphaRef;         // 0.0 - 1.0 (normalized from DX8's 0-255)
 uniform int u_AlphaFunc;          // D3DCMPFUNC enum value
 
-// Texture stage configuration
-// Each stage has: COLOROP, COLORARG1, COLORARG2, ALPHAOP, ALPHAARG1, ALPHAARG2
-// For efficiency, we encode the active stage count and common ops as uniforms
-uniform int u_TextureStageCount;
-
 // D3DRS_TEXTUREFACTOR
 uniform vec4 u_TextureFactor;
 
-// Per-stage color/alpha operation (D3DTEXTUREOP)
-// 1=DISABLE, 2=SELECTARG1, 3=SELECTARG2, 4=MODULATE, 5=MODULATE2X,
-// 6=MODULATE4X, 7=ADD, 8=ADDSIGNED, 9=ADDSIGNED2X, 13=BLENDTEXTUREALPHA,
-// 16=BLENDCURRENTALPHA, 18=MODULATEALPHA_ADDCOLOR, 24=DOTPRODUCT3, 25=MULTIPLYADD
-uniform int u_Stage0_ColorOp;
-uniform int u_Stage1_ColorOp;
-uniform int u_Stage0_AlphaOp;
-uniform int u_Stage1_AlphaOp;
-
-// D3DTSS_COLORARG0/1/2, ALPHAARG0/1/2 for stages 0 and 1 (D3DTA_*: low 4 bits select,
-// 0x10 COMPLEMENT, 0x20 ALPHAREPLICATE). Bit n of u_TexBound: stage n has a texture
-// (D3D reads an unbound stage's texture as opaque white).
-uniform int u_StageArgs[12];
+// Texture stages 0-3, as D3D8 fixed function runs them. u_StageOps: COLOROP, ALPHAOP per
+// stage (D3DTEXTUREOP). u_StageArgs: COLORARG0/1/2, ALPHAARG0/1/2 per stage (D3DTA_*: low
+// 4 bits select, 0x10 COMPLEMENT, 0x20 ALPHAREPLICATE). Bit n of u_TexBound: stage n has a
+// texture (D3D reads an unbound stage's texture as opaque white).
+uniform int u_StageOps[8];
+uniform int u_StageArgs[24];
 uniform int u_TexBound;
+
+// D3DRS_SPECULARENABLE: add the specular colour after the stages.
+uniform bool u_SpecularEnable;
+in vec4 v_Specular;
+
+// A ps.1.1 pixel shader set with SetPixelShader replaces the stages (u_PSCount > 0).
+// Two ivec4 per instruction (encoded by GLES3_Create_Pixel_Shader):
+//   [2i]   = (opcode | writemask << 8 | shift << 12 | saturate << 16, dst, src0, src1)
+//   [2i+1] = (src2, 0, 0, 0)
+// A register is 0-1 r0-r1, 2-5 t0-t3, 6-7 v0-v1, 8-15 c0-c7; a source adds swizzle << 5
+// (1 = .a, 2 = .b replicate) and modifier << 8 (D3DSPSM_*).
+uniform int u_PSCount;
+uniform ivec4 u_PS[32];
+uniform vec4 u_PSConst[8];
 
 // Output
 out vec4 fragColor;
@@ -320,81 +340,123 @@ bool alpha_test(float alpha) {
     return true;
 }
 
+vec4 sample_stage(int s) {
+    if ((u_TexBound & (1 << s)) == 0) return vec4(1.0);
+    if (s == 0) return texture(u_Texture0, v_TexCoord0.xy / v_TexCoord0.z);
+    if (s == 1) return texture(u_Texture1, v_TexCoord1.xy / v_TexCoord1.z);
+    if (s == 2) return texture(u_Texture2, v_TexCoord2.xy / v_TexCoord2.z);
+    return texture(u_Texture3, v_TexCoord3.xy / v_TexCoord3.z);
+}
+
 vec4 stage_arg(int a, vec4 diffuse, vec4 current, vec4 tex) {
     int sel = a & 15;
     vec4 v = sel == 0 ? diffuse : sel == 2 ? tex : sel == 3 ? u_TextureFactor
-           : sel == 4 ? vec4(0.0) : current; // 1 CURRENT; 4 SPECULAR (none); 5 TEMP as CURRENT
+           : sel == 4 ? v_Specular : current; // 1 CURRENT; 5 TEMP as CURRENT
     if ((a & 16) != 0) v = vec4(1.0) - v;
     if ((a & 32) != 0) v = vec4(v.a);
     return v;
 }
 
-// Apply a texture stage color operation
-vec3 apply_color_op(int op, vec4 arg1, vec4 arg2, vec4 arg0) {
-    if (op <= 1) return arg2.rgb;            // DISABLE → pass through
-    if (op == 2) return arg1.rgb;            // SELECTARG1
-    if (op == 3) return arg2.rgb;            // SELECTARG2
-    if (op == 4) return arg1.rgb * arg2.rgb;     // MODULATE
-    if (op == 5) return arg1.rgb * arg2.rgb * 2.0; // MODULATE2X
-    if (op == 6) return arg1.rgb * arg2.rgb * 4.0; // MODULATE4X
-    if (op == 7) return arg1.rgb + arg2.rgb;     // ADD
-    if (op == 8) return clamp(arg1.rgb + arg2.rgb - vec3(0.5), 0.0, 1.0); // ADDSIGNED
-    if (op == 9) return clamp((arg1.rgb + arg2.rgb - vec3(0.5)) * 2.0, 0.0, 1.0); // ADDSIGNED2X
-    if (op == 13) return mix(arg2.rgb, arg1.rgb, arg1.a); // BLENDTEXTUREALPHA
-    if (op == 16) return mix(arg2.rgb, arg1.rgb, arg2.a); // BLENDCURRENTALPHA
-    if (op == 18) return clamp(arg1.rgb + arg1.a * arg2.rgb, 0.0, 1.0); // MODULATEALPHA_ADDCOLOR
-    if (op == 24) { // DOTPRODUCT3
-        return vec3(clamp(4.0 * dot(arg1.rgb - vec3(0.5), arg2.rgb - vec3(0.5)), 0.0, 1.0));
-    }
-    if (op == 25) return arg0.rgb + arg1.rgb * arg2.rgb; // MULTIPLYADD
-    return arg1.rgb * arg2.rgb;                  // default: MODULATE
+// One D3DTEXTUREOP on all four channels; the caller keeps .rgb (colour) or .a (alpha).
+vec4 tex_op(int op, vec4 a1, vec4 a2, vec4 a0, vec4 diffuse, vec4 current, vec4 tex) {
+    vec4 r;
+    if (op == 2) r = a1;                                   // SELECTARG1
+    else if (op == 3) r = a2;                              // SELECTARG2
+    else if (op == 5) r = a1 * a2 * 2.0;                   // MODULATE2X
+    else if (op == 6) r = a1 * a2 * 4.0;                   // MODULATE4X
+    else if (op == 7) r = a1 + a2;                         // ADD
+    else if (op == 8) r = a1 + a2 - 0.5;                   // ADDSIGNED
+    else if (op == 9) r = (a1 + a2 - 0.5) * 2.0;           // ADDSIGNED2X
+    else if (op == 10) r = a1 - a2;                        // SUBTRACT
+    else if (op == 11) r = a1 + a2 - a1 * a2;              // ADDSMOOTH
+    else if (op == 12) r = mix(a2, a1, diffuse.a);         // BLENDDIFFUSEALPHA
+    else if (op == 13) r = mix(a2, a1, tex.a);             // BLENDTEXTUREALPHA
+    else if (op == 14) r = mix(a2, a1, u_TextureFactor.a); // BLENDFACTORALPHA
+    else if (op == 15) r = a1 + a2 * (1.0 - tex.a);        // BLENDTEXTUREALPHAPM
+    else if (op == 16) r = mix(a2, a1, current.a);         // BLENDCURRENTALPHA
+    else if (op == 18) r = a1 + a1.a * a2;                 // MODULATEALPHA_ADDCOLOR
+    else if (op == 19) r = a1 * a2 + a1.a;                 // MODULATECOLOR_ADDALPHA
+    else if (op == 20) r = (1.0 - a1.a) * a2 + a1;         // MODULATEINVALPHA_ADDCOLOR
+    else if (op == 21) r = (1.0 - a1) * a2 + a1.a;         // MODULATEINVCOLOR_ADDALPHA
+    else if (op == 22 || op == 23) r = a2;                 // BUMPENVMAP*: no bump, pass on
+    else if (op == 24) r = vec4(4.0 * dot(a1.rgb - 0.5, a2.rgb - 0.5)); // DOTPRODUCT3
+    else if (op == 25) r = a0 + a1 * a2;                   // MULTIPLYADD
+    else if (op == 26) r = mix(a2, a1, a0);                // LERP
+    else r = a1 * a2;                                      // MODULATE, PREMODULATE
+    return clamp(r, 0.0, 1.0);                             // D3D saturates every stage
 }
 
-// Apply a texture stage alpha operation
-float apply_alpha_op(int op, float arg1, float arg2) {
-    if (op <= 1) return arg2;
-    if (op == 2) return arg1;            // SELECTARG1
-    if (op == 3) return arg2;            // SELECTARG2
-    if (op == 4) return arg1 * arg2;     // MODULATE
-    if (op == 7) return clamp(arg1 + arg2, 0.0, 1.0); // ADD
-    return arg1 * arg2;
+vec4 ps_src(vec4 R[16], int s) {
+    vec4 v = R[s & 15];
+    int swz = (s >> 5) & 3;
+    if (swz == 1) v = vec4(v.a); else if (swz == 2) v = vec4(v.b);
+    int m = (s >> 8) & 15;
+    if (m == 1) v = -v;                          // NEG
+    else if (m == 2) v = v - 0.5;                // BIAS
+    else if (m == 3) v = 0.5 - v;                // BIASNEG
+    else if (m == 4) v = v * 2.0 - 1.0;          // SIGN
+    else if (m == 5) v = 1.0 - v * 2.0;          // SIGNNEG
+    else if (m == 6) v = 1.0 - v;                // COMP
+    else if (m == 7) v = v * 2.0;                // X2
+    else if (m == 8) v = -v * 2.0;               // X2NEG
+    return v;
+}
+
+vec4 run_pixel_shader() {
+    vec4 R[16];
+    R[0] = vec4(0.0); R[1] = vec4(0.0);
+    for (int i = 0; i < 4; i++) R[2 + i] = sample_stage(i);
+    R[6] = v_Color; R[7] = v_Specular;
+    for (int i = 0; i < 8; i++) R[8 + i] = u_PSConst[i];
+    for (int i = 0; i < 16; i++) {
+        if (i >= u_PSCount) break;
+        ivec4 a = u_PS[2 * i];
+        int op = a.x & 255;
+        if (op == 66) continue; // tex: the stage samples are already in t0-t3
+        vec4 s0 = ps_src(R, a.z), s1 = ps_src(R, a.w), s2 = ps_src(R, u_PS[2 * i + 1].x);
+        vec4 r;
+        if (op == 1) r = s0;                          // mov
+        else if (op == 2) r = s0 + s1;                // add
+        else if (op == 3) r = s0 - s1;                // sub
+        else if (op == 4) r = s0 * s1 + s2;           // mad
+        else if (op == 8) r = vec4(dot(s0.rgb, s1.rgb)); // dp3
+        else if (op == 9) r = vec4(dot(s0, s1));      // dp4
+        else if (op == 18) r = mix(s2, s1, s0);       // lrp
+        else r = s0 * s1;                             // mul
+        int shift = (a.x >> 12) & 15;
+        if (shift == 1) r *= 2.0; else if (shift == 2) r *= 4.0; else if (shift == 15) r *= 0.5;
+        r = ((a.x >> 16) & 1) != 0 ? clamp(r, 0.0, 1.0) : clamp(r, -1.0, 1.0); // ps.1.1 range
+        int mask = (a.x >> 8) & 15;
+        R[a.y] = mix(R[a.y], r, bvec4((mask & 1) != 0, (mask & 2) != 0, (mask & 4) != 0, (mask & 8) != 0));
+    }
+    return clamp(R[0], 0.0, 1.0);
 }
 
 void main() {
     vec4 diffuse = v_Color;
     vec4 color = v_Color; // CURRENT: the diffuse colour at stage 0
 
-    // --- Texture Stages 0 and 1 (base; lightmaps, detail textures) ---
-    for (int s = 0; s < 2; s++) {
-        if (u_TextureStageCount <= s) break;
-        vec4 tex = vec4(1.0);
-        if ((u_TexBound & (1 << s)) != 0)
-            tex = s == 0 ? texture(u_Texture0, v_TexCoord0.xy / v_TexCoord0.z)
-                         : texture(u_Texture1, v_TexCoord1.xy / v_TexCoord1.z);
-        int cop = s == 0 ? u_Stage0_ColorOp : u_Stage1_ColorOp;
-        int aop = s == 0 ? u_Stage0_AlphaOp : u_Stage1_AlphaOp;
-        if (cop <= 1) break; // D3DTOP_DISABLE ends the chain here
-        int b = s * 6;
-        vec4 c0 = stage_arg(u_StageArgs[b + 0], diffuse, color, tex);
-        vec4 c1 = stage_arg(u_StageArgs[b + 1], diffuse, color, tex);
-        vec4 c2 = stage_arg(u_StageArgs[b + 2], diffuse, color, tex);
-        float a1 = stage_arg(u_StageArgs[b + 4], diffuse, color, tex).a;
-        float a2 = stage_arg(u_StageArgs[b + 5], diffuse, color, tex).a;
-        vec3 rgb = apply_color_op(cop, c1, c2, c0);
-        if (aop > 1) color.a = apply_alpha_op(aop, a1, a2);
-        color.rgb = rgb;
-    }
-
-    // --- Texture Stage 2 (rare — special effects) ---
-    if (u_TextureStageCount >= 3) {
-        vec4 tex2 = texture(u_Texture2, v_TexCoord2.xy / v_TexCoord2.z);
-        color.rgb *= tex2.rgb;  // MODULATE
-    }
-
-    // --- Texture Stage 3 (very rare) ---
-    if (u_TextureStageCount >= 4) {
-        vec4 tex3 = texture(u_Texture3, v_TexCoord3.xy / v_TexCoord3.z);
-        color.rgb *= tex3.rgb;
+    if (u_PSCount > 0) {
+        color = run_pixel_shader();
+    } else {
+        for (int s = 0; s < 4; s++) {
+            int cop = u_StageOps[s * 2], aop = u_StageOps[s * 2 + 1];
+            if (cop <= 1) break; // D3DTOP_DISABLE ends the chain here
+            vec4 tex = sample_stage(s);
+            int b = s * 6;
+            vec4 c0 = stage_arg(u_StageArgs[b + 0], diffuse, color, tex);
+            vec4 c1 = stage_arg(u_StageArgs[b + 1], diffuse, color, tex);
+            vec4 c2 = stage_arg(u_StageArgs[b + 2], diffuse, color, tex);
+            vec3 rgb = tex_op(cop, c1, c2, c0, diffuse, color, tex).rgb;
+            if (aop > 1) {
+                vec4 x0 = vec4(stage_arg(u_StageArgs[b + 3], diffuse, color, tex).a);
+                vec4 x1 = vec4(stage_arg(u_StageArgs[b + 4], diffuse, color, tex).a);
+                vec4 x2 = vec4(stage_arg(u_StageArgs[b + 5], diffuse, color, tex).a);
+                color.a = tex_op(aop, x1, x2, x0, diffuse, color, tex).a;
+            }
+            color.rgb = rgb;
+        }
+        if (u_SpecularEnable) color.rgb = clamp(color.rgb + v_Specular.rgb, 0.0, 1.0);
     }
 
     // --- Alpha test ---

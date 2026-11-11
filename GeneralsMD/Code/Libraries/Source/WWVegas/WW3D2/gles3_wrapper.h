@@ -105,6 +105,7 @@ enum GLES3_RenderState {
   GLES3_RS_STENCILMASK = 58,
   GLES3_RS_STENCILWRITEMASK = 59,
   GLES3_RS_TEXTUREFACTOR = 60,
+  GLES3_RS_SPECULARENABLE = 29,
   GLES3_RS_ZBIAS = 47,
   GLES3_RS_MAX = 256
 };
@@ -241,6 +242,8 @@ struct GLES3_PipelineState {
   unsigned int render_states[GLES3_RS_MAX];
   bool vertex_has_color; // current FVF carries D3DFVF_DIFFUSE
   bool pretransformed;   // current FVF is D3DFVF_XYZRHW (screen-space positions)
+  unsigned int pixel_shader;   // GLES3_Create_Pixel_Shader handle, 0 = fixed function
+  float ps_const[8][4];        // pixel shader constants c0-c7
 
   // Alpha test (emulated in fragment shader since GLES3 removed it)
   bool alpha_test_enabled;
@@ -289,6 +292,7 @@ struct GLES3_ProgramUniformLocations {
     GLint attenuation2;
     GLint ambient;
     GLint range;
+    GLint specular;
   } u_Lights[4];
   GLint u_FogEnabled;
   GLint u_FogColor;
@@ -298,11 +302,11 @@ struct GLES3_ProgramUniformLocations {
   GLint u_AlphaRef;
   GLint u_AlphaFunc;
   GLint u_Texture[4];
-  GLint u_TextureStageCount;
-  GLint u_Stage0_ColorOp;
-  GLint u_Stage1_ColorOp;
-  GLint u_Stage0_AlphaOp;
-  GLint u_Stage1_AlphaOp;
+  GLint u_StageOps;
+  GLint u_SpecularEnable;
+  GLint u_PSCount;
+  GLint u_PS;
+  GLint u_PSConst;
   GLint u_ColorVertex;
   GLint u_StageArgs;
   GLint u_TexBound;
@@ -464,6 +468,13 @@ void GLES3_Set_Light(unsigned int index, const GLES3_Light* light);
 void GLES3_Enable_Light(unsigned int index, bool enable);
 void GLES3_Set_Vertex_Has_Color(bool has_color);
 void GLES3_Set_Pretransformed(bool pretransformed);
+
+// ps.1.1 pixel shaders (CreatePixelShader / SetPixelShader / SetPixelShaderConstant).
+// Create returns a handle > 0, or 0 when the program uses something the emulation lacks
+// (texbem and the like): the caller then keeps the fixed-function stages, as before.
+unsigned int GLES3_Create_Pixel_Shader(const unsigned int* tokens);
+void GLES3_Set_Pixel_Shader(unsigned int handle);
+void GLES3_Set_Pixel_Shader_Constants(unsigned int first, const float* data, unsigned int count);
 void GLES3_Set_Material(const GLES3_Material* mat);
 void GLES3_Set_Fog(bool enable, float r, float g, float b,
                     float start, float end);

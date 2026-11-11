@@ -96,10 +96,13 @@ struct GLES3_CachedUniformState {
     int alpha_test_enabled;
     float alpha_ref;
     int alpha_func;
-    int tex_stage_count;
-    int s0_cop, s1_cop, s0_aop, s1_aop;
+    int stage_ops[8];
+    int specular_enable;
+    unsigned int pixel_shader;
+    float ps_const[8][4];
+    float light_specular[4][4];
     int color_vertex;
-    int stage_args[12];
+    int stage_args[24];
     int tex_bound;
     int pretransformed;
     float viewport_rect[4];
@@ -283,6 +286,9 @@ bool GLES3_Init(void* hwnd, bool lite) {
         g_State.texture_stage_state[i][GLES3_TSS_ALPHAARG2] = 1;
         g_State.texture_stage_state[i][GLES3_TSS_COLORARG0] = 1;
         g_State.texture_stage_state[i][GLES3_TSS_ALPHAARG0] = 1;
+        // Stage 0 modulates texture and diffuse; later stages start disabled.
+        g_State.texture_stage_state[i][GLES3_TSS_COLOROP] = i == 0 ? 4 : 1;
+        g_State.texture_stage_state[i][GLES3_TSS_ALPHAOP] = i == 0 ? 2 : 1;
     }
     // D3D stencil defaults, which are also GL's: func ALWAYS, ops KEEP, masks all ones.
     // GL is set up below with depth test and depth writes on; record that too.
@@ -724,6 +730,79 @@ void GLES3_Set_Vertex_Has_Color(bool has_color) {
 
 void GLES3_Set_Pretransformed(bool pretransformed) {
     g_State.pretransformed = pretransformed;
+}
+
+// ---------------------------------------------------------------------------
+// ps.1.1 pixel shaders. The game's are short (terrain blend, flat terrain, roads,
+// monochrome filter): tex, mov, add, sub, mul, mad, dp3, dp4, lrp with the usual source
+// modifiers. Each is encoded for the fragment shader's interpreter (see u_PS there).
+// ---------------------------------------------------------------------------
+struct GLES3_PSProgram { int count; int data[16 * 8]; };
+static std::vector<GLES3_PSProgram> g_PixelShaders;
+
+// Register file index: r0-r1 0-1, t0-t3 2-5, v0-v1 6-7, c0-c7 8-15.
+static int PS_Reg(unsigned int tok, bool& ok) {
+    unsigned int type = (tok >> 28) & 7, num = tok & 0x7FF;
+    if (type == 0 && num < 2) return (int)num;       // D3DSPR_TEMP
+    if (type == 3 && num < 4) return 2 + (int)num;   // D3DSPR_TEXTURE
+    if (type == 1 && num < 2) return 6 + (int)num;   // D3DSPR_INPUT
+    if (type == 2 && num < 8) return 8 + (int)num;   // D3DSPR_CONST
+    ok = false;
+    return 0;
+}
+
+static int PS_Src(unsigned int tok, bool& ok) {
+    int r = PS_Reg(tok, ok);
+    unsigned int swz = (tok >> 16) & 0xFF, mod = (tok >> 24) & 0xF;
+    int sw = swz == 0xE4 ? 0 : swz == 0xFF ? 1 : swz == 0xAA ? 2 : -1;
+    if (sw < 0 || mod > 8) ok = false;
+    return r | ((sw < 0 ? 0 : sw) << 5) | ((int)mod << 8);
+}
+
+unsigned int GLES3_Create_Pixel_Shader(const unsigned int* t) {
+    if (!t || (t[0] & 0xFFFF0000u) != 0xFFFF0000u || (t[0] & 0xFFFF) > 0x0104) return 0;
+    GLES3_PSProgram p = {};
+    bool ok = true;
+    for (unsigned int i = 1; ok && i < 512;) {
+        unsigned int ins = t[i++], op = ins & 0xFFFF;
+        if (op == 0xFFFF) break;                                     // end
+        if (op == 0xFFFE) { i += (ins >> 16) & 0x7FFF; continue; }   // comment
+        if (op == 0) continue;                                       // nop
+        int nsrc;
+        switch (op) {
+            case 66: nsrc = 0; break;                                // tex
+            case 1: nsrc = 1; break;                                 // mov
+            case 2: case 3: case 5: case 8: case 9: nsrc = 2; break; // add sub mul dp3 dp4
+            case 4: case 18: nsrc = 3; break;                        // mad lrp
+            default: nsrc = -1; break;                               // texbem, def, cnd, ...
+        }
+        if (nsrc < 0 || p.count >= 16) { ok = false; break; }
+        unsigned int dst = t[i++];
+        int* d = &p.data[p.count++ * 8];
+        if (op == 66) { d[0] = 66; continue; } // the stage samples are loaded up front
+        d[0] = (int)op | (int)((dst >> 16) & 0xF) << 8 | (int)((dst >> 24) & 0xF) << 12
+             | (int)((dst >> 20) & 1) << 16; // write mask, result shift, saturate
+        d[1] = PS_Reg(dst, ok);
+        for (int k = 0; k < nsrc; k++) d[2 + k] = PS_Src(t[i++], ok);
+    }
+    if (!ok || p.count == 0) return 0;
+    g_PixelShaders.push_back(p);
+    return (unsigned int)g_PixelShaders.size();
+}
+
+void GLES3_Set_Pixel_Shader(unsigned int handle) {
+    g_State.pixel_shader = handle <= g_PixelShaders.size() ? handle : 0;
+}
+
+void GLES3_Set_Pixel_Shader_Constants(unsigned int first, const float* data, unsigned int count) {
+    for (unsigned int i = 0; data && i < count && first + i < 8; i++)
+        memcpy(g_State.ps_const[first + i], data + i * 4, sizeof(float) * 4);
+}
+
+static void GLES3_Upload_Pixel_Shader(const GLES3_ProgramUniformLocations& locs, unsigned int handle) {
+    const GLES3_PSProgram* p = handle ? &g_PixelShaders[handle - 1] : nullptr;
+    if (locs.u_PSCount != -1) glUniform1i(locs.u_PSCount, p ? p->count : 0);
+    if (p && locs.u_PS != -1) glUniform4iv(locs.u_PS, p->count * 2, p->data);
 }
 
 void GLES3_Enable_Light(unsigned int index, bool enable) {
@@ -1303,6 +1382,8 @@ void GLES3_ShaderManager::Populate_Locations(GLuint program, unsigned int hash) 
         locs.u_Lights[i].ambient = glGetUniformLocation(program, name);
         snprintf(name, sizeof(name), "u_Lights[%d].range", i);
         locs.u_Lights[i].range = glGetUniformLocation(program, name);
+        snprintf(name, sizeof(name), "u_Lights[%d].specular", i);
+        locs.u_Lights[i].specular = glGetUniformLocation(program, name);
     }
 
     locs.u_FogEnabled = glGetUniformLocation(program, "u_FogEnabled");
@@ -1319,11 +1400,11 @@ void GLES3_ShaderManager::Populate_Locations(GLuint program, unsigned int hash) 
         locs.u_Texture[i] = glGetUniformLocation(program, name);
     }
 
-    locs.u_TextureStageCount = glGetUniformLocation(program, "u_TextureStageCount");
-    locs.u_Stage0_ColorOp = glGetUniformLocation(program, "u_Stage0_ColorOp");
-    locs.u_Stage1_ColorOp = glGetUniformLocation(program, "u_Stage1_ColorOp");
-    locs.u_Stage0_AlphaOp = glGetUniformLocation(program, "u_Stage0_AlphaOp");
-    locs.u_Stage1_AlphaOp = glGetUniformLocation(program, "u_Stage1_AlphaOp");
+    locs.u_StageOps = glGetUniformLocation(program, "u_StageOps");
+    locs.u_SpecularEnable = glGetUniformLocation(program, "u_SpecularEnable");
+    locs.u_PSCount = glGetUniformLocation(program, "u_PSCount");
+    locs.u_PS = glGetUniformLocation(program, "u_PS");
+    locs.u_PSConst = glGetUniformLocation(program, "u_PSConst");
     locs.u_ColorVertex = glGetUniformLocation(program, "u_ColorVertex");
     locs.u_StageArgs = glGetUniformLocation(program, "u_StageArgs");
     locs.u_TexBound = glGetUniformLocation(program, "u_TexBound");
@@ -1465,6 +1546,10 @@ void GLES3_ShaderManager::Apply_Uniforms(GLuint program,
                 glUniform1f(locs.u_Lights[i].range, state.lights[i].range);
                 cache.lights[i].range = state.lights[i].range;
             }
+            if (locs.u_Lights[i].specular != -1 && (!cache.initialized || memcmp(cache.light_specular[i], state.lights[i].specular, sizeof(state.lights[i].specular)) != 0)) {
+                glUniform4fv(locs.u_Lights[i].specular, 1, state.lights[i].specular);
+                memcpy(cache.light_specular[i], state.lights[i].specular, sizeof(state.lights[i].specular));
+            }
         } else {
             if (locs.u_Lights[i].enabled != -1 && (!cache.initialized || cache.lights[i].enabled != 0)) {
                 glUniform1i(locs.u_Lights[i].enabled, 0);
@@ -1517,48 +1602,29 @@ void GLES3_ShaderManager::Apply_Uniforms(GLuint program,
         }
     }
 
-    // Texture stage count — highest active stage index + 1.
+    // Texture stage ops (stages 0-3), D3DRS_SPECULARENABLE and the pixel shader.
     {
-        int tex_stage_count = 0;
-        for (int i = 3; i >= 0; i--) {
-            bool has_texture = (state.bound_textures[i] != 0);
-            int cop = (int)state.texture_stage_state[i][GLES3_TSS_COLOROP];
-            int aop = (int)state.texture_stage_state[i][GLES3_TSS_ALPHAOP];
-            bool has_op = (cop > 1) || (aop > 1);
-            if (has_texture || has_op) {
-                tex_stage_count = i + 1;
-                break;
-            }
+        int ops[8];
+        for (int i = 0; i < 4; i++) {
+            ops[i * 2] = (int)state.texture_stage_state[i][GLES3_TSS_COLOROP];
+            ops[i * 2 + 1] = (int)state.texture_stage_state[i][GLES3_TSS_ALPHAOP];
         }
-        if (locs.u_TextureStageCount != -1 && (!cache.initialized || cache.tex_stage_count != tex_stage_count)) {
-            glUniform1i(locs.u_TextureStageCount, tex_stage_count);
-            cache.tex_stage_count = tex_stage_count;
+        if (locs.u_StageOps != -1 && (!cache.initialized || memcmp(cache.stage_ops, ops, sizeof(ops)) != 0)) {
+            glUniform1iv(locs.u_StageOps, 8, ops);
+            memcpy(cache.stage_ops, ops, sizeof(ops));
         }
-    }
-
-    // Texture stage color/alpha ops
-    {
-        int s0_cop = (int)state.texture_stage_state[0][GLES3_TSS_COLOROP];
-        int s1_cop = (int)state.texture_stage_state[1][GLES3_TSS_COLOROP];
-        int s0_aop = (int)state.texture_stage_state[0][GLES3_TSS_ALPHAOP];
-        int s1_aop = (int)state.texture_stage_state[1][GLES3_TSS_ALPHAOP];
-        if (s0_cop == 0 && state.bound_textures[0] != 0) s0_cop = 4;
-        if (s0_aop == 0 && state.bound_textures[0] != 0) s0_aop = 2;
-        if (locs.u_Stage0_ColorOp != -1 && (!cache.initialized || cache.s0_cop != s0_cop)) {
-            glUniform1i(locs.u_Stage0_ColorOp, s0_cop);
-            cache.s0_cop = s0_cop;
+        int spec = state.render_states[GLES3_RS_SPECULARENABLE] ? 1 : 0;
+        if (locs.u_SpecularEnable != -1 && (!cache.initialized || cache.specular_enable != spec)) {
+            glUniform1i(locs.u_SpecularEnable, spec);
+            cache.specular_enable = spec;
         }
-        if (locs.u_Stage1_ColorOp != -1 && (!cache.initialized || cache.s1_cop != s1_cop)) {
-            glUniform1i(locs.u_Stage1_ColorOp, s1_cop);
-            cache.s1_cop = s1_cop;
+        if (!cache.initialized || cache.pixel_shader != state.pixel_shader) {
+            GLES3_Upload_Pixel_Shader(locs, state.pixel_shader);
+            cache.pixel_shader = state.pixel_shader;
         }
-        if (locs.u_Stage0_AlphaOp != -1 && (!cache.initialized || cache.s0_aop != s0_aop)) {
-            glUniform1i(locs.u_Stage0_AlphaOp, s0_aop);
-            cache.s0_aop = s0_aop;
-        }
-        if (locs.u_Stage1_AlphaOp != -1 && (!cache.initialized || cache.s1_aop != s1_aop)) {
-            glUniform1i(locs.u_Stage1_AlphaOp, s1_aop);
-            cache.s1_aop = s1_aop;
+        if (locs.u_PSConst != -1 && (!cache.initialized || memcmp(cache.ps_const, state.ps_const, sizeof(state.ps_const)) != 0)) {
+            glUniform4fv(locs.u_PSConst, 8, &state.ps_const[0][0]);
+            memcpy(cache.ps_const, state.ps_const, sizeof(state.ps_const));
         }
     }
 
@@ -1575,9 +1641,9 @@ void GLES3_ShaderManager::Apply_Uniforms(GLuint program,
     }
 
     {
-        // Stages 0-1: COLORARG0/1/2 then ALPHAARG0/1/2 (D3DTA_* incl. modifier bits).
-        int args[12];
-        for (int st = 0; st < 2; st++) {
+        // Stages 0-3: COLORARG0/1/2 then ALPHAARG0/1/2 (D3DTA_* incl. modifier bits).
+        int args[24];
+        for (int st = 0; st < 4; st++) {
             const unsigned int* t = state.texture_stage_state[st];
             args[st * 6 + 0] = (int)t[GLES3_TSS_COLORARG0];
             args[st * 6 + 1] = (int)t[GLES3_TSS_COLORARG1];
@@ -1587,7 +1653,7 @@ void GLES3_ShaderManager::Apply_Uniforms(GLuint program,
             args[st * 6 + 5] = (int)t[GLES3_TSS_ALPHAARG2];
         }
         if (locs.u_StageArgs != -1 && (!cache.initialized || memcmp(cache.stage_args, args, sizeof(args)) != 0)) {
-            glUniform1iv(locs.u_StageArgs, 12, args);
+            glUniform1iv(locs.u_StageArgs, 24, args);
             memcpy(cache.stage_args, args, sizeof(args));
         }
         int bound = 0;

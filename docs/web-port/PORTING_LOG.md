@@ -1553,3 +1553,39 @@ deployed build (only the flashing general's button differs), 8 stencil bits, no 
 Not exercised by that scene: fog, stencil shadows, point lights. Still open (should-fix): stages
 2-3 always modulate, missing ADDSMOOTH/SUBTRACT/specular, SetRenderTarget no-op, authored mips
 replaced by glGenerateMipmap, small DXT mips under-allocated, no S3TC fallback.
+
+## 2026-11-11 — Session 19: Pixel shaders, four texture stages, specular, small DXT levels
+
+The should-fix items from the Session 18 review, starting with the terrain blend edges.
+
+- **Terrain blends (hard snow edges) — root cause: no pixel shader ever ran.** The web build reports
+  PS 1.1, so the game picks TerrainShaderPixelShader (terrain.pso: `lrp r0, v0.a, t1, t0` then
+  `mul r0, r0, v0`) and the flat/road variants. Two things stopped it: LoadAndCreateD3DShader sized
+  its buffer with getFileInfo, which returns 0 for these backslash archive paths here, so the
+  shader tokens were never read; and the shim's CreatePixelShader/SetPixelShader were stubs. The
+  terrain then drew with whatever stage states were left over: dark, unlit by the vertex colour,
+  and with no blend between the base and blend tile. Fixed: the loader asks the open file for its
+  size; CreatePixelShader parses ps.1.1 tokens (tex, mov, add, sub, mul, mad, dp3, dp4, lrp; write
+  masks, _x2/_x4/_d2, _sat; .a/.b replicate; neg/bias/sign/comp/x2 source modifiers) into a small
+  program the fragment shader interprets, with c0-c7 from SetPixelShaderConstant. A program with
+  anything else (texbem: wave, motion blur) gets no handle, so its caller keeps the fixed-function
+  path as before. Trees still use the fixed-function path (their vertex shader is not emulated, so
+  the game never selects the pixel shader for them). Water's runtime-assembled shaders are untouched
+  (D3DXAssembleShader still fails).
+- **Texture stages 0-3** now all run D3D's op chain with their own COLORARG0/1/2 and ALPHAARG0/1/2,
+  stop at the first DISABLE, and saturate every stage (MODULATE2X no longer feeds >1 onward). Added
+  SUBTRACT, ADDSMOOTH, BLENDDIFFUSEALPHA, BLENDFACTORALPHA, BLENDTEXTUREALPHAPM,
+  MODULATECOLOR_ADDALPHA, MODULATEINV*, LERP, and the same ops on the alpha side. BLENDTEXTUREALPHA
+  and BLENDCURRENTALPHA now use the texture's and current alpha (they used arg1.a/arg2.a).
+  Stage ops are seeded with D3D's defaults (stage 0 MODULATE/SELECTARG1, others DISABLE).
+- **Specular.** Vertex specular colour (FVF SPECULAR, attribute 11) is passed through when lighting
+  is off; with lighting on, Blinn-Phong per light (local viewer, material power and specular, light
+  specular). D3DRS_SPECULARENABLE adds it after the stages; D3DTA_SPECULAR reads it.
+- **DXT levels below 4x4** were allocated w*h*BPP bytes, less than one 8/16-byte block; they get
+  whole blocks now (texture levels and standalone surfaces).
+
+Verified in headless Edge (same LAN game, Alpine Assault): snow and grass patches blend softly, the
+terrain is lit by the vertex colour (it was much darker), no WebGL errors. Not exercised: specular
+(nothing in that scene enables it), the monochrome filter, fog, stencil shadows, point lights.
+Still open: SetRenderTarget no-op, authored mips replaced by glGenerateMipmap, no S3TC fallback,
+a texture changed while bound is not re-uploaded, COLORWRITEENABLE ignored.

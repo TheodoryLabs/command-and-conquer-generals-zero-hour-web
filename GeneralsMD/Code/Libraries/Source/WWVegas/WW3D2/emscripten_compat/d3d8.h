@@ -426,6 +426,15 @@ static inline UINT D3DFmt_BPP(D3DFORMAT fmt) {
     }
 }
 
+// Bytes to hold one w x h level. DXT data is 4x4 blocks (8 bytes DXT1, 16 DXT3/5), so a
+// level below 4x4 still needs a whole block; w*h*BPP alone is less than that for 1x1/2x1.
+static inline size_t D3DFmt_Level_Bytes(D3DFORMAT fmt, UINT w, UINT h) {
+    size_t px = (size_t)w * h * D3DFmt_BPP(fmt);
+    size_t bs = fmt == (D3DFORMAT)827611204 ? 8 : (fmt == (D3DFORMAT)861165636 || fmt == (D3DFORMAT)894720068) ? 16 : 0;
+    size_t blocks = bs * ((w + 3) / 4) * ((h + 3) / 4);
+    return px > blocks ? px : blocks;
+}
+
 // ---------------------------------------------------------------------------
 // CPU-buffer-backed surface — returned by GetSurfaceLevel / CreateImageSurface.
 // Release() deletes this object since it's always heap-allocated.
@@ -504,7 +513,7 @@ struct Emscripten_IDirect3DTexture8 : public IDirect3DTexture8 {
         UINT mw = Width, mh = Height;
         for (UINT i = 0; i < LevelCount; ++i) {
             levels[i].w = mw; levels[i].h = mh;
-            levels[i].pixels.assign((size_t)mw * mh * BPP, 0);
+            levels[i].pixels.assign(D3DFmt_Level_Bytes(Fmt, mw, mh), 0);
             if (mw > 1) mw >>= 1;
             if (mh > 1) mh >>= 1;
         }
@@ -649,7 +658,7 @@ inline Emscripten_IDirect3DSurface8::Emscripten_IDirect3DSurface8()
 inline Emscripten_IDirect3DSurface8::Emscripten_IDirect3DSurface8(UINT w, UINT h, D3DFORMAT fmt)
     : Width(w), Height(h), BytesPerPixel(D3DFmt_BPP(fmt)), Format(fmt)
 {
-    Pixels.assign((size_t)w * h * BytesPerPixel, 0);
+    Pixels.assign(D3DFmt_Level_Bytes(fmt, w, h), 0);
 }
 
 inline Emscripten_IDirect3DSurface8::~Emscripten_IDirect3DSurface8() {
@@ -1008,7 +1017,7 @@ struct Emscripten_IDirect3DDevice8 : public IDirect3DDevice8 {
             current_fvf = Handle;
         return 0;
     }
-    virtual HRESULT SetPixelShader(DWORD Handle) override { return 0; }
+    virtual HRESULT SetPixelShader(DWORD Handle) override { GLES3_Set_Pixel_Shader(Handle); return 0; }
 
     // Helper: decode current FVF and apply vertex attrib pointers (VBO must be bound).
     //
@@ -1232,7 +1241,10 @@ struct Emscripten_IDirect3DDevice8 : public IDirect3DDevice8 {
                                           DWORD ConstantCount) override { return 0; }
     virtual HRESULT SetPixelShaderConstant(DWORD Register,
                                          const void *pConstantData,
-                                         DWORD ConstantCount) override { return 0; }
+                                         DWORD ConstantCount) override {
+        GLES3_Set_Pixel_Shader_Constants(Register, (const float *)pConstantData, ConstantCount);
+        return 0;
+    }
     virtual HRESULT SetClipPlane(DWORD Index, const float *pPlane) override { return 0; }
     virtual HRESULT CreateImageSurface(UINT Width, UINT Height, D3DFORMAT Format,
                                      IDirect3DSurface8 **ppSurface) override {
@@ -1249,7 +1261,13 @@ struct Emscripten_IDirect3DDevice8 : public IDirect3DDevice8 {
                                      const DWORD *pFunction, DWORD *pHandle,
                                      DWORD Usage) override { return 0; }
     virtual HRESULT DeleteVertexShader(DWORD Handle) override { return 0; }
-    virtual HRESULT CreatePixelShader(const DWORD *pFunction, DWORD *pHandle) override { return 0; }
+    // A program the emulation can't run (texbem, ...) gets no handle, so the caller's handle
+    // stays 0 and the fixed-function stages draw it, as before pixel shaders were emulated.
+    virtual HRESULT CreatePixelShader(const DWORD *pFunction, DWORD *pHandle) override {
+        unsigned int h = GLES3_Create_Pixel_Shader((const unsigned int *)pFunction);
+        if (h && pHandle) *pHandle = h;
+        return 0;
+    }
     virtual HRESULT DeletePixelShader(DWORD Handle) override { return 0; }
     virtual HRESULT ValidateDevice(DWORD *pNumPasses) override { return 0; }
     virtual HRESULT ResourceManagerDiscardBytes(DWORD Bytes) override { return 0; }

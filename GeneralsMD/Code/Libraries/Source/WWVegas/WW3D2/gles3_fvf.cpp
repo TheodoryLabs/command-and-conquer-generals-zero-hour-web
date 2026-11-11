@@ -227,6 +227,16 @@ void GLES3_FVFDecoder::Apply_Vertex_Attribs(unsigned int stride,
         glVertexAttrib4f(ATTR_COLOR, 1.0f, 1.0f, 1.0f, 1.0f);
     }
 
+    // --- Specular color (location 11; 7-10 are the instance matrix) --- BGRA like diffuse.
+    if (fvf & D3DFVF_SPECULAR) {
+        glEnableVertexAttribArray(11);
+        glVertexAttribPointer(11, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride,
+            (const void*)(uintptr_t)(base_offset_bytes + specular_offset));
+    } else {
+        glDisableVertexAttribArray(11);
+        glVertexAttrib4f(11, 0.0f, 0.0f, 0.0f, 0.0f);
+    }
+
     // --- Texture coordinates ---
     unsigned int tex_count = Get_Tex_Count(fvf);
     for (unsigned int i = 0; i < 4; i++) {  // shader supports up to 4
